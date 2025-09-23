@@ -13,7 +13,7 @@ fi
 PYTORCH_JIT=0 python3 train_ppo_arm.py \
   +platform=debug \
   +env=icra_base \
-  +run=icra_ours \
+  +run=icra_ours_abs_rel \
   ++env.seed=56081 \
   ++tag=policy \
   ++global_device=cuda:0 \

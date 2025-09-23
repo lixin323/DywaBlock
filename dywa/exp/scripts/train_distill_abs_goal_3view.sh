@@ -1,5 +1,5 @@
 #!/bin/bash
-cd dywa/scripts/train
+cd dywa/exp/train
 
 name='abs_goal_3view'
 root="/home/user/DyWA/output/dywa"

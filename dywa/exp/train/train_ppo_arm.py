@@ -680,24 +680,22 @@ def load_env(cfg: Config, path,
     # Use relative goal between current object pose
     # and the goal pose, instead of absolute goal.
     if cfg.use_rel_goal:
-        env = RelGoal(env, 'goal',
-                      use_6d=cfg.use_6d_rel_goal)
+        env = RelGoal(env, use_6d=cfg.use_6d_rel_goal)
         if cfg.use_6d_rel_goal:
-            update_obs_bound('goal',
+            update_obs_bound('rel_goal',
                              OBS_BOUND_MAP.get('relpose6d'))
         else:
-            update_obs_bound('goal',
+            update_obs_bound('rel_goal',
                              OBS_BOUND_MAP.get('relpose'))
         if cfg.add_abs_goal:
-            env = AddAbsGoal(env, 'goal',
-                         use_6d=cfg.use_6d_rel_goal)
+            env = AddAbsGoal(env, use_6d=cfg.use_6d_rel_goal)
             if cfg.use_6d_rel_goal:
-                update_obs_bound('goal',
+                update_obs_bound('rel_goal',
                                 OBS_BOUND_MAP.get('relpose6d'))
                 update_obs_bound('abs_goal',
                                 OBS_BOUND_MAP.get('pose6d'))
             else:
-                update_obs_bound('goal',
+                update_obs_bound('rel_goal',
                                 OBS_BOUND_MAP.get('relpose'))
                 update_obs_bound('abs_goal',
                                 OBS_BOUND_MAP.get('pose'))

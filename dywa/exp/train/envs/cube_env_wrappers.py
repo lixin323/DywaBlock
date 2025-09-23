@@ -962,7 +962,7 @@ class RelGoal(ObservationWrapper):
         n: int = 9 if use_6d else 7
         obs_space, update_fn = add_obs_field(
             env.observation_space,
-            'goal', spaces.Box(-1.0, 1.0, (n,))
+            'rel_goal', spaces.Box(-1.0, 1.0, (n,))
         )
         self._obs_space = obs_space
         self._update_fn = update_fn
