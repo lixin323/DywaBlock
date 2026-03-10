@@ -305,9 +305,14 @@ events.*
 
 
 ### data
-datasets
+Dywa_abs_1view
+data
+corn
 docker/Downloads
 docker/*whl
+docker/nvdiffrast
+docker/mvp
+docker/pytorch-cosine-annealing-with-warmup
 isaacgym
 ckpts 
 output

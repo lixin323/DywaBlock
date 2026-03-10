@@ -2,7 +2,7 @@
 # FIXME: Changed docker source to solve networking issues.
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda:11.3.1-devel-ubuntu20.04
 
-FROM ${BASE_IMAGE} as base
+FROM ${BASE_IMAGE} AS base
 
 # NOTE: Avoid questions during build process
 ENV DEBIAN_FRONTEND=noninteractive
@@ -91,7 +91,10 @@ RUN rm /usr/lib/x86_64-linux-gnu/libEGL_mesa.so.0 /usr/lib/x86_64-linux-gnu/libE
 COPY nvidia_icd.json /usr/share/vulkan/icd.d/nvidia_icd.json
 COPY 10_nvidia.json /usr/share/glvnd/egl_vendor.d/10_nvidia.json
 
-
+# 确保CUDA编译器和库路径正确
+ENV PATH="/usr/local/cuda/bin:${PATH}"
+ENV CUDA_HOME="/usr/local/cuda"
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 # Setup GUI-access enabled user.
 # FIXME: Perhaps unnecessary since we need to run with
 # --privileged option anyways (for network access).
@@ -211,9 +214,16 @@ ENV TORCH_CUDA_ARCH_LIST='Ampere'
 # RUN python3 -m pip install --upgrade \
 #     torch-points3d
 
+
 # Install `nvdiffrast` for fast mesh rasterization.
-RUN python3 -m pip install --upgrade \
-    git+https://bgithub.xyz/NVlabs/nvdiffrast.git
+# 为避免权限问题，我们在 root 下 COPY 并修改属主，然后再切回普通用户安装。
+USER root
+COPY nvdiffrast /tmp/nvdiffrast
+RUN chown -R ${USERNAME}:${GID} /tmp/nvdiffrast
+USER ${USERNAME}
+# 使用本地 COPY 的源码安装，避免构建时从 GitHub clone（TLS/网络不稳定）。
+# 按官方提示使用 --no-build-isolation，确保能复用已安装的 torch 环境。
+RUN FORCE_CUDA=1 python3 -m pip install --upgrade --verbose --no-build-isolation /tmp/nvdiffrast
 
 # Install PySDF for signed-distance function generations.
 # Install torchmcubes for visualization.
@@ -242,12 +252,12 @@ RUN python3 -m pip install --upgrade \
     graspnetAPI
 
 # # Extra package (MVP)
-#RUN cd $HOME/Downloads/mvp/ && \
-#    python3 -m pip install --upgrade \
-#    . &&\
-#    cd $HOME
-RUN python3 -m pip install --upgrade \
-    git+https://bgithub.xyz/ir413/mvp
+# 使用与 nvdiffrast 相同的策略：从宿主机提前 clone 的源码本地安装，避免构建时访问 GitHub。
+USER root
+COPY mvp /tmp/mvp
+RUN chown -R ${USERNAME}:${GID} /tmp/mvp
+USER ${USERNAME}
+RUN python3 -m pip install --upgrade --no-build-isolation /tmp/mvp
 
 # Upgrade Open3D for visualization
 RUN python3 -m pip install open3d --upgrade
@@ -273,7 +283,11 @@ RUN python3 -m pip install --upgrade \
 # Extra packages for training scripts
 RUN python3 -m pip install --upgrade numpy
 # For pretraining
-RUN python3 -m pip install git+https://bgithub.xyz/katsura-jp/pytorch-cosine-annealing-with-warmup
+USER root
+COPY pytorch-cosine-annealing-with-warmup /tmp/pytorch-cosine-annealing-with-warmup
+RUN chown -R ${USERNAME}:${GID} /tmp/pytorch-cosine-annealing-with-warmup
+USER ${USERNAME}
+RUN python3 -m pip install --upgrade --no-build-isolation /tmp/pytorch-cosine-annealing-with-warmup
 # For policy training
 RUN python3 -m pip install --upgrade opt_einsum coacd pymeshlab
 

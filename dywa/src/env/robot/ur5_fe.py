@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import pkg_resources
-from typing import Tuple, Iterable, List, Optional
+from typing import Tuple, Iterable, List, Optional, Dict
 import einops
 
 from isaacgym import gymtorch
@@ -141,6 +141,11 @@ class UR5FE(RobotBase):
         rot_type: str = 'axis_angle'
 
         keepout_radius: float = 0.2
+        regularize: Optional[str] = None
+        default_hand_friction: float = 1.5
+        randomize_hand_friction: bool = False
+        min_hand_friction: float = 1.0
+        max_hand_friction: float = 1.2
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -156,11 +161,17 @@ class UR5FE(RobotBase):
         self.q_hi: th.Tensor = None
         self._first = True
         self.q_home: th.Tensor = None
+        self.robot_radius: float = 0.12
+        self.robot_radii: float = self.robot_radius
 
     def setup(self, env: 'EnvBase'):
         # FIXME: introspection!
         self.num_env = env.cfg.num_env
         self.device = th.device(env.cfg.th_device)
+        self.cur_hand_friction = th.full((self.num_env,),
+                                         self.cfg.default_hand_friction,
+                                         dtype=th.float,
+                                         device=self.device)
 
         self.indices = th.as_tensor(
             find_actor_indices(env.gym, env.envs, 'robot'),
@@ -256,7 +267,7 @@ class UR5FE(RobotBase):
             gymapi.DOMAIN_ENV)
             for i in range(len(BODY_NAMES))]
 
-    def create_assets(self, gym, sim):
+    def create_assets(self, gym, sim, counts: Optional[Dict[str, int]] = None):
         cfg = self.cfg
         asset_options = gymapi.AssetOptions()
         # asset_options.armature = 0.01
@@ -281,6 +292,11 @@ class UR5FE(RobotBase):
         self.n_bodies = gym.get_asset_rigid_body_count(robot_asset)
         print(F'>>>> n_bodies = {self.n_bodies}')
         self.n_dofs = gym.get_asset_dof_count(robot_asset)
+
+        if counts is not None:
+            counts['body'] = self.n_bodies
+            counts['shape'] = gym.get_asset_rigid_shape_count(robot_asset)
+
         dof_props = gym.get_asset_dof_properties(robot_asset)
         dof_lo = []
         dof_hi = []
@@ -518,6 +534,13 @@ class UR5FE(RobotBase):
         if USE_CUSTOM_CONTROLLER:
             return indices, None, None
         else:
+            if self.cfg.randomize_hand_friction:
+                num_reset = len(I)
+                self.cur_hand_friction[I] = (th.empty((num_reset,),
+                                                      dtype=th.float,
+                                                      device=self.device)
+                                             .uniform_(self.cfg.min_hand_friction,
+                                                       self.cfg.max_hand_friction))
             return indices, qpos, qvel
 
     @nvtx.annotate("UR5FE.apply_actions")
@@ -691,3 +714,6 @@ class UR5FE(RobotBase):
                 gymtorch.unwrap_tensor(indices),
                 len(indices)
             )
+
+    def step_controller(self, gym, sim, env):
+        pass

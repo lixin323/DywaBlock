@@ -124,6 +124,10 @@ class PPO(nn.Module):
         self.value_net = value_net
         self.path = path
         self.writer = writer
+        # Global training step used for logging/saving.
+        # NOTE: This is intentionally not a parameter/buffer, so it is not
+        # included in `state_dict()` unless we explicitly persist it.
+        self.run_step: int = 0
 
         # Framework to deal with auxiliary modules & losses
         self.extra_nets = None
@@ -695,14 +699,45 @@ class PPO(nn.Module):
         return hidden1, done
 
     def load(self, path: str, strict: bool = False):
+        """
+        Load model weights (and optionally training metadata).
+
+        Backward-compatible with older checkpoints that only contain
+        state_dict entries.
+        """
+        ckpt = th.load(str(path), map_location='cpu')
+        # Old format: directly a dict of state_dicts (e.g. {"self": ...})
+        if isinstance(ckpt, dict) and 'self' in ckpt and isinstance(ckpt['self'], dict):
+            load_ckpt(dict(self=self),
+                      ckpt_file=ckpt,
+                      strict=strict)
+            meta = ckpt.get('meta', None)
+            if isinstance(meta, dict):
+                rs = meta.get('run_step', None)
+                if isinstance(rs, int):
+                    self.run_step = rs
+                os_ = meta.get('optim_step', None)
+                if isinstance(os_, int):
+                    self.optim_step = os_
+            return
+        # Fallback: let generic loader try its best.
         load_ckpt(dict(self=self),
-                  ckpt_file=path,
+                  ckpt_file=ckpt,
                   strict=strict)
 
     def save(self, path: str):
+        """
+        Save weights plus minimal training metadata (run_step/optim_step).
+        """
         ensure_directory(Path(path).parent)
-        save_ckpt(dict(self=self),
-                  ckpt_file=path)
+        save_dict = {
+            'self': self.state_dict(),
+            'meta': {
+                'run_step': int(getattr(self, 'run_step', 0)),
+                'optim_step': int(getattr(self, 'optim_step', 0)),
+            }
+        }
+        th.save(save_dict, str(path))
 
     def init(self, obs):
         """
@@ -818,8 +853,10 @@ class PPO(nn.Module):
                 range(cfg.train.train_steps),
                 disable=(not cfg.train.use_tqdm),
                 desc=desc) as pbar:
-            for step in pbar:
+            for _ in pbar:
+                step = int(getattr(self, 'run_step', 0))
                 hidden, done = self.interact(step, hidden, done)
                 self._maybe_train(step)
                 self._maybe_save(step)
+                self.run_step = step + 1
                 yield step

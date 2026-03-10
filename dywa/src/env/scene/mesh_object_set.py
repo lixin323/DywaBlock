@@ -87,7 +87,7 @@ class MeshObjectSet(ObjectSet):
 
         self.__files = {str(Path(m).stem): m
                         for m in files}
-        self.__mesh = {k: trimesh.load(v)
+        self.__mesh = {k: trimesh.load(v, force='mesh')
                        for k, v in self.__files.items()}
         self.__keys = sorted(list(self.__mesh.keys()))
         print(self.__keys)

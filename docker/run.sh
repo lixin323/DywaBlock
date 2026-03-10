@@ -3,10 +3,10 @@
 set -exu
 
 # CONFIGURE DATA PATHS (please modify according to your environment)
-IG_PATH="/path/to/isaacgym"
-CACHE_PATH="/path/to/.cache"
-DATA_PATH="/path/to/data"
-TMP_PATH="/path/to/tmp"
+IG_PATH="/home/lixin/DyWA/isaacgym"
+CACHE_PATH="/home/lixin/DyWA/.cache"
+DATA_PATH="/home/lixin/DyWA/data"
+TMP_PATH="/home/lixin/DyWA/tmp"
 
 # Figure out repository root.
 SCRIPT_DIR="$( cd "$( dirname $(realpath "${BASH_SOURCE[0]}") )" && pwd )"

@@ -3,7 +3,8 @@
 from typing import Optional
 from dataclasses import dataclass
 from pathlib import Path
-from huggingface_hub import HfApi, hf_hub_download
+import os
+from huggingface_hub import HfApi, hf_hub_download as _hf_hub_download
 from util.config import ConfigBase
 
 
@@ -51,7 +52,14 @@ def upload_ckpt(repo_id: str,
     )
 
 
+def hf_hub_download(repo_id: str, name: str) -> str:
+    offline = os.environ.get('HF_HUB_OFFLINE', '').lower() in ('1', 'true', 'yes')
+    local_only = os.environ.get('HF_LOCAL_ONLY', '').lower() in ('1', 'true', 'yes')
+    ckpt_file: str = _hf_hub_download(
+        repo_id, name, local_files_only=(offline or local_only))
+    return ckpt_file
+
+
 def download_ckpt(repo_id: str, name: str) -> str:
-    """ Download checkpoint from huggingface model hub. """
     ckpt_file: str = hf_hub_download(repo_id, name)
     return ckpt_file

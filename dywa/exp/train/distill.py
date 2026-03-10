@@ -239,9 +239,9 @@ class StudentAgentRMA(nn.Module):
         self.vision_tokens = pcd_tokens = self.point_tokenizer(obs['partial_cloud'])
 
         ## goal tokens
-        if self.cfg.use_gpcd:
+        if self.cfg.use_gpcd and ('goal_cloud' in obs):
             gpcd_tokens = self.point_tokenizer(obs['goal_cloud'])
-            self.vision_tokens = th.concat([pcd_tokens, gpcd_tokens], dim=-2) 
+            self.vision_tokens = th.concat([pcd_tokens, gpcd_tokens], dim=-2)
 
         ## encoder
         embed_tokens = self.encoder(self.vision_tokens)

@@ -8,6 +8,7 @@ from typing import Dict, Optional, Iterable
 from dataclasses import dataclass
 from gym import spaces
 from functools import reduce
+import re
 
 import torch as th
 import numpy as np
@@ -40,6 +41,8 @@ FrankaDofPosVelNoGripper = spaces.Box(-2 * np.pi, +2 * np.pi, (14,))
 FrankaDofPosWithGripper = spaces.Box(-2 * np.pi, +2 * np.pi, (9,))
 # in case we implement mimic joints, should be (16,) -> (15,)
 FrankaDofPosVelWithGripper = spaces.Box(-2 * np.pi, +2 * np.pi, (16,))
+UR5DofPosNoGripper = spaces.Box(-2 * np.pi, +2 * np.pi, (6,))
+UR5DofPosVelNoGripper = spaces.Box(-2 * np.pi, +2 * np.pi, (12,))
 Mass = spaces.Box(-np.inf, +np.inf, (1,))
 PhysParams = spaces.Box(-np.inf, +np.inf, (5,))
 
@@ -55,8 +58,10 @@ OBS_SPACE_MAP = {
     'pose6d_vel': Pose6dVel,
     'keypoint': Keypoint,
     'cloud': Cloud512,
+    'pos6': UR5DofPosNoGripper,
     'pos7': FrankaDofPosNoGripper,
     'pos9': FrankaDofPosWithGripper,
+    'pos_vel6': UR5DofPosVelNoGripper,
     'pos_vel7': FrankaDofPosVelNoGripper,
     'pos_vel9': FrankaDofPosVelWithGripper,
     'wrench': Wrench,
@@ -134,10 +139,13 @@ def _get_obs_bound_map():
     pose6d_vel = _merge_bounds(pose6d, lin_vel, ang_vel)
     keypoint = (point[0] * 8, point[1] * 8)  # flattened for some reason...
     cloud = point  # exploits broadcasting
+    pos6 = ([0] * 6, [1] * 6)
     pos7 = ([0] * 7, [1] * 7)
     pos9 = ([0] * 9, [1] * 9)
+    vel6 = ([0] * 6, [1] * 6)
     vel7 = ([0] * 7, [1] * 7)
     vel9 = ([0] * 9, [1] * 9)
+    pos_vel6 = _merge_bounds(pos6, vel6)
     pos_vel7 = _merge_bounds(pos7, vel7)
     pos_vel9 = _merge_bounds(pos9, vel9)
     force = ([0] * 3, [30] * 3)
@@ -164,10 +172,13 @@ def _get_obs_bound_map():
         pose6d_vel=pose6d_vel,
         keypoint=keypoint,
         cloud=cloud,
+        pos6=pos6,
         pos7=pos7,
         pos9=pos9,
+        vel6=vel6,
         vel7=vel7,
         vel9=vel9,
+        pos_vel6=pos_vel6,
         pos_vel7=pos_vel7,
         pos_vel9=pos_vel9,
         force=force,
@@ -261,14 +272,18 @@ class ArmEnvWrapper(ObservationWrapper):
 
     def __robot_state(self):
         cfg = self.cfg
-        if cfg.robot_state_type.startswith('pos_vel'):
-            return self.tensors['dof'].reshape(
-                self.tensors['dof'].shape[0], -1)
-        elif cfg.robot_state_type.startswith('pos'):
-            return self.tensors['dof'][..., :, 0]
+        dof = self.tensors['dof']
+        n_dof_total = dof.shape[-2]
+        m = re.match(r'^(pos_vel|pos)(\d+)?$', cfg.robot_state_type)
+        if m is None:
+            raise ValueError(F'Unknown robot_state_type={cfg.robot_state_type}')
+        kind = m.group(1)
+        n = int(m.group(2)) if m.group(2) is not None else n_dof_total
+        n = min(n, n_dof_total)
+        if kind == 'pos_vel':
+            return dof[..., :n, :].reshape(dof.shape[0], -1)
         else:
-            raise ValueError(
-                F'Unknown robot_state_type={cfg.robot_state_type}')
+            return dof[..., :n, 0]
 
     def __hand_state(self):
         cfg = self.cfg
