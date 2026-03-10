@@ -239,9 +239,15 @@ class StudentAgentRMA(nn.Module):
         self.vision_tokens = pcd_tokens = self.point_tokenizer(obs['partial_cloud'])
 
         ## goal tokens
-        if self.cfg.use_gpcd and ('goal_cloud' in obs):
-            gpcd_tokens = self.point_tokenizer(obs['goal_cloud'])
-            self.vision_tokens = th.concat([pcd_tokens, gpcd_tokens], dim=-2)
+        if self.cfg.use_gpcd:
+            if 'goal_cloud' in obs:
+                gpcd_tokens = self.point_tokenizer(obs['goal_cloud'])
+            else:
+                # 若环境尚未提供 goal_cloud，则退化为重复 partial_cloud，
+                # 以保持 encoder 输入维度与预训练时一致（4096）。
+                gpcd_tokens = pcd_tokens
+            # 在最后一维拼接 partial + goal
+            self.vision_tokens = th.concat([pcd_tokens, gpcd_tokens], dim=-1)
 
         ## encoder
         embed_tokens = self.encoder(self.vision_tokens)

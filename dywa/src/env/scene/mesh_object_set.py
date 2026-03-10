@@ -76,6 +76,13 @@ class MeshObjectSet(ObjectSet):
             verbose=True
         )
 
+        # --- PhyBlock 预处理数据支持 ---
+        # 是否使用离线生成的 coacd.obj 和点云 .npy
+        use_phyblock_preprocess: bool = False
+        # 预处理后的点云与 collision mesh 根目录（容器内路径）
+        phyblock_pc_root: str = '/input/PhyBlock/dywa_processed/point_clouds'
+        phyblock_coacd_root: str = '/input/PhyBlock/dywa_processed/collision_meshes'
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
@@ -85,8 +92,11 @@ class MeshObjectSet(ObjectSet):
         files = glob.glob(cfg.filename,
                           recursive=True)
 
+        # 原始可视 mesh 文件
         self.__files = {str(Path(m).stem): m
                         for m in files}
+
+        # 加载网格
         self.__mesh = {k: trimesh.load(v, force='mesh')
                        for k, v in self.__files.items()}
         self.__keys = sorted(list(self.__mesh.keys()))
@@ -152,17 +162,44 @@ class MeshObjectSet(ObjectSet):
         for k in self.__keys:
             m = self.__masses[k]
             I = self.__mesh[k].moment_inertia
+
+            # 可视 mesh 一直用原始 obj
             vis_mesh_file = self.__files[k]
 
             aux = {}
             col_mesh_file = F'{self.__tmpdir}/{k}.obj'
-            if True:
-                shutil.copy(vis_mesh_file, col_mesh_file)
-                aux['num_part'] = 1
+
+            if cfg.use_phyblock_preprocess:
+                # 使用预处理生成的 coacd.obj 作为碰撞体
+                # 从原始路径推断出相对路径，例如：
+                # /input/PhyBlock/data/block_assets/arch_red.obj
+                # -> arch_red_coacd.obj 位于
+                # /input/PhyBlock/dywa_processed/collision_meshes/...
+                src_path = Path(vis_mesh_file)
+                try:
+                    rel = src_path.relative_to('/input/PhyBlock/data/block_assets')
+                except ValueError:
+                    # 若无法 relative_to，直接退化为旧逻辑
+                    rel = src_path.name
+                rel = Path(rel)
+                coacd_path = Path(cfg.phyblock_coacd_root) / rel.parent / f'{rel.stem}_coacd.obj'
+                if coacd_path.is_file():
+                    shutil.copy(str(coacd_path), col_mesh_file)
+                    aux['num_part'] = 1  # 多凸块已在 coacd.obj 中合并
+                else:
+                    # 找不到预处理文件时，回退到旧行为：直接使用可视 mesh
+                    shutil.copy(vis_mesh_file, col_mesh_file)
+                    aux['num_part'] = 1
             else:
-                apply_coacd(cfg.coacd,
-                            vis_mesh_file,
-                            col_mesh_file, aux=aux)
+                # 旧行为：直接使用可视 mesh 或在线调用 CoACD
+                if True:
+                    shutil.copy(vis_mesh_file, col_mesh_file)
+                    aux['num_part'] = 1
+                else:
+                    apply_coacd(cfg.coacd,
+                                vis_mesh_file,
+                                col_mesh_file, aux=aux)
+
             ic(vis_mesh_file, col_mesh_file)
             self.__metadata[k]['num_chulls'] = (
                 aux['num_part']
