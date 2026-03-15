@@ -361,22 +361,44 @@ class AddRelGoalCloud(ObservationWrapper):
         obs = self._update_fn(obs, goal_pc)
         return obs
 
+def _get_scene_from_env(env) -> Optional[object]:
+    """Unwrap until we get an env that has .scene (e.g. PushEnv)."""
+    e = env
+    while e is not None:
+        scene = getattr(e, 'scene', None)
+        if scene is not None:
+            return scene
+        e = getattr(e, 'env', None)
+    return None
+
+
+def _upsample_cloud(pc: th.Tensor, target_n: int) -> th.Tensor:
+    """Repeat points to get [..., target_n, 3]. pc shape [..., N, 3], N <= target_n."""
+    n = pc.shape[-2]
+    if n >= target_n:
+        return pc[..., :target_n, :]
+    # repeat indices to fill target_n
+    idx = th.arange(target_n, device=pc.device) % n
+    return pc[..., idx, :]
+
+
 class AddInitialCloud(ObservationWrapper):
     """
-    Record Initial Point Cloud
-    call: initial, partial=0, reset
+    Record Initial Point Cloud.
+    When scene provides cur_initial_cloud (e.g. PhyBlock canonical clouds),
+    use it; otherwise use partial_cloud (upsampled to num_point if needed).
     """
 
     def __init__(self, env,
                  key: str = 'initial_cloud',
                  key_pc: str = 'partial_cloud',
-                 num_point: int = 512,
+                 num_point: int = 2048,
                  ):
         super().__init__(env, self._wrap_obs)
-        
+        self.num_point = num_point
         self.initial_cloud = th.zeros((env.num_env, num_point, 3),
-                                  dtype=th.float,
-                                  device=env.device)
+                                      dtype=th.float,
+                                      device=env.device)
         self.reset_indices = None
 
         obs_space, self.update_fn = add_obs_field(
@@ -389,6 +411,7 @@ class AddInitialCloud(ObservationWrapper):
         self.key_pc = key_pc
 
         normalizer = self.unwrap(target=NormalizeEnv).normalizer
+        # initial_cloud may have different n_point than key_pc; reuse same per-point stats
         normalizer.obs_rms[self.key] = copy.deepcopy(normalizer.obs_rms[self.key_pc])
 
     @property
@@ -396,13 +419,24 @@ class AddInitialCloud(ObservationWrapper):
         return self._obs_space
 
     def _wrap_obs(self, obs):
-        if self.reset_indices is not None:
-            if self.reset_indices.numel() != 0:
-                self.initial_cloud[self.reset_indices] = obs[self.key_pc][self.reset_indices]
-        else: ### 只有第一回会调用
-            self.initial_cloud = obs[self.key_pc]
+        scene = _get_scene_from_env(self.env)
+        from_scene = (
+            scene is not None
+            and getattr(scene, 'cur_initial_cloud', None) is not None
+        )
+        if from_scene:
+            src = scene.cur_initial_cloud
+            if src.shape[-2] != self.num_point:
+                src = _upsample_cloud(src, self.num_point)
+        else:
+            src = _upsample_cloud(obs[self.key_pc], self.num_point)
 
-        self.reset_indices = th.tensor([],device= self.env.device)
+        if self.reset_indices is not None and self.reset_indices.numel() != 0:
+            self.initial_cloud[self.reset_indices] = src[self.reset_indices]
+        else:
+            self.initial_cloud = src.clone()
+
+        self.reset_indices = th.tensor([], device=self.env.device)
         obs = self.update_fn(obs, self.initial_cloud)
         return obs
     
@@ -504,13 +538,15 @@ class AddInitialRelGoal(ObservationWrapper):
     
 class AddInitialGoalCloud(ObservationWrapper):
     '''
-    called: init-partial=0, reset
+    用 initial_cloud + initial_rel_goal 算出 goal_cloud。
+    若 obs 中已有 initial_cloud（如任务 2 由 scene 提供），则安全使用；
+    否则回退到 partial_cloud（上采样到 cloud_size），避免 KeyError。
     '''
     @dataclass
     class Config:
         src_keys: str = 'initial_cloud'
         dst_key: str = 'goal_cloud'
-        cloud_size: int = 512
+        cloud_size: int = 2048
 
     def __init__(self, cfg, env):
         super().__init__(env, self._wrap_obs)
@@ -529,25 +565,28 @@ class AddInitialGoalCloud(ObservationWrapper):
         normalizer = self.unwrap(target=NormalizeEnv).normalizer
         normalizer.obs_rms[self.cfg.dst_key] = copy.deepcopy(normalizer.obs_rms[self.cfg.src_keys])
 
-
     @property
     def observation_space(self):
         return self._obs_space
 
     def _wrap_obs(self, obs):
-        '''
-        initial point cloud transfer to rel goal
-        '''
         norm = self.unwrap(target=NormalizeEnv)
-        un_obs = {self.cfg.src_keys:obs[self.cfg.src_keys]}
+        # 保护：优先使用 obs 里已有的 initial_cloud（任务 2 由 scene 提供），否则用 partial_cloud 回退
+        if 'initial_cloud' in obs:
+            base_pc = obs['initial_cloud']
+            unnorm_key = self.cfg.src_keys
+        else:
+            base_pc = _upsample_cloud(obs['partial_cloud'], self.cfg.cloud_size)
+            unnorm_key = 'partial_cloud'
+
+        un_obs = {unnorm_key: base_pc}
         un_obs = norm.normalizer.unnormalize_obs(un_obs)
+        initial_pc = un_obs[unnorm_key]
 
-        initial_pc = un_obs[self.cfg.src_keys]
         initial_rel_goal = pose9d_to_matrix(obs['initial_rel_goal'])
-        goal_pc = th.bmm(initial_pc, initial_rel_goal[:, :3, :3].transpose(1, 2)) + initial_rel_goal[:, :3, 3].unsqueeze(1)  
+        goal_pc = th.bmm(initial_pc, initial_rel_goal[:, :3, :3].transpose(1, 2)) + initial_rel_goal[:, :3, 3].unsqueeze(1)
 
-        t_obs = {}
-        t_obs[self.cfg.dst_key] = goal_pc.clone()
+        t_obs = {self.cfg.dst_key: goal_pc.clone()}
         goal_pc = norm.normalizer.normalize_obs(t_obs)[self.cfg.dst_key]
 
         obs = self._update_fn(obs, goal_pc)
@@ -604,23 +643,18 @@ def setup_rma_env_v2(cfg, env, agent,
     env = PerturbCloud(cfg.perturb_cloud, env)
     env = PerturbGoal(cfg.perturb_goal, env)
     env = PopDict(env, ['icp_emb'])
-    if is_student:
-        env = AddStudentState(env, agent, state_size)
+    # 先加 initial_cloud / goal_cloud，再加 AddStudentState，这样 student.reset(obs) 收到的 obs 里才有 goal_cloud
     if cfg.use_goal_cloud:
         if cfg.goal_cloud_type == 'rel':
             env = AddRelGoalCloud(cfg.rel_goal_cloud, env)
         elif cfg.goal_cloud_type == 'initial':
             env = AddInitialCloud(env)
             env = AddInitialRelGoal(env, use_6d= cfg.use_6d_rel_goal)
-            # if cfg.use_6d_rel_goal:
-            #     update_obs_bound('initial_rel_goal',
-            #                     OBS_BOUND_MAP.get('relpose6d'))
-            # else:
-            #     update_obs_bound('initial_rel_goal',
-            #                     OBS_BOUND_MAP.get('relpose'))
             env = AddInitialGoalCloud(cfg.initial_goal_cloud, env)
         else:
             raise NotImplementedError(cfg.goal_cloud_type)
+    if is_student:
+        env = AddStudentState(env, agent, state_size)
     if cfg.use_shuffle_cloud:
         env = ShuffleCloud(cfg.shuffle_cloud, env)
     return env

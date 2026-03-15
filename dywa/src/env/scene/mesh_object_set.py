@@ -135,14 +135,55 @@ class MeshObjectSet(ObjectSet):
             self.__poses[k] = poses.astype(np.float32)
 
         # NOTE: unnecessarily computationally costly maybe
+        # 为了兼容原有逻辑，仍然维护在线采样的 cloud / normal / bbox 信息；
+        # 如果启用了 PhyBlock 预处理，则优先使用离线点云 `.npy` 作为 canonical cloud。
         self.__cloud = {}
         self.__normal = {}
         self.__bbox = {}
         self.__aabb = {}
         self.__obb = {}
+
+        # 离线 canonical 点云（仅在 use_phyblock_preprocess=True 时有效）
+        self.canonical_clouds = {}
+
         for k, v in self.__mesh.items():
+            # 默认：从 mesh 表面在线采样 cfg.num_points 个点
             samples, face_index = trimesh.sample.sample_surface(
                 v, cfg.num_points)
+
+            # 如果使用 PhyBlock 预处理，尝试从 .npy 加载离线点云作为 canonical cloud
+            if cfg.use_phyblock_preprocess:
+                mesh_path = Path(self.__files[k])
+                try:
+                    # /input/PhyBlock/data/block_assets/... -> /input/PhyBlock/dywa_processed/point_clouds/...
+                    rel = mesh_path.relative_to('/input/PhyBlock/data/block_assets')
+                    pc_path = Path(cfg.phyblock_pc_root) / rel.parent / (rel.stem + '.npy')
+                except ValueError:
+                    # 路径结构不符合预期时，直接拼接文件名
+                    pc_path = Path(cfg.phyblock_pc_root) / (mesh_path.stem + '.npy')
+
+                if pc_path.is_file():
+                    try:
+                        pc = np.load(pc_path).astype(np.float32)  # 期望形状约为 [2048, 3]
+                        # 如有需要，下采样到 cfg.num_points（通常为 512），
+                        # 以兼容已有 cloud_size / point_tokenizer 配置。
+                        if pc.shape[0] > cfg.num_points:
+                            idx = np.random.choice(pc.shape[0],
+                                                   cfg.num_points,
+                                                   replace=False)
+                            pc_sub = pc[idx]
+                        else:
+                            pc_sub = pc
+                        samples = pc_sub  # 用离线点云替换在线采样
+                        # 记录完整 canonical cloud（保留原始点数，如 2048），供后续 initial_cloud 使用
+                        self.canonical_clouds[k] = pc
+                    except Exception:
+                        # 如果 .npy 损坏或读取失败，则退回在线采样结果
+                        self.canonical_clouds[k] = samples.astype(np.float32)
+                else:
+                    # 找不到离线文件时，仍然提供在线采样 cloud，避免中断
+                    self.canonical_clouds[k] = samples.astype(np.float32)
+
             self.__cloud[k] = samples
             self.__normal[k] = v.face_normals[face_index]
             self.__aabb[k] = v.bounds

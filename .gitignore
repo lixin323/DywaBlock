@@ -307,6 +307,7 @@ events.*
 ### data
 Dywa_abs_1view
 data
+dywa-origin
 corn
 docker/Downloads
 docker/*whl

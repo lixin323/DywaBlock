@@ -120,6 +120,29 @@ def _array_from_map(
     return th.stack([maps[k] for k in keys], dim=0).to(**kwds)
 
 
+# 用于 initial_cloud 的固定点数（与 RMA obs 一致）
+INITIAL_CLOUD_SIZE: int = 2048
+
+
+def _canonical_clouds_to_tensor(
+        keys: List[str],
+        canonical_clouds: Dict[str, np.ndarray],
+        target_n: int,
+        device: th.device) -> th.Tensor:
+    """将 canonical_clouds 转为 [len(keys), target_n, 3] 的 tensor，不足则重复填充，超出则下采样。"""
+    out = np.empty((len(keys), target_n, 3), dtype=np.float32)
+    for i, k in enumerate(keys):
+        pc = np.asarray(canonical_clouds[k], dtype=np.float32)
+        n = pc.shape[0]
+        if n >= target_n:
+            idx = np.random.choice(n, target_n, replace=False)
+            out[i] = pc[idx]
+        else:
+            idx = np.random.choice(n, target_n, replace=True)
+            out[i] = pc[idx]
+    return th.as_tensor(out, device=device)
+
+
 class TableTopWithObjectScene(TableTopScene):
 
     @dataclass
@@ -337,6 +360,8 @@ class TableTopWithObjectScene(TableTopScene):
         self.cur_names: List[str] = None
         self.cur_cloud: th.Tensor = None
         self.cur_normal: th.Tensor = None
+        self.cur_initial_cloud: th.Tensor = None
+        self.initial_cloud: th.Tensor = None
         self.cur_predefined_goals: th.Tensor = None
         self.cur_object_friction: th.Tensor = None
         self.cur_table_friction: th.Tensor = None
@@ -612,6 +637,9 @@ class TableTopWithObjectScene(TableTopScene):
             if cfg.load_cloud:
                 self.cloud[..., :] = (self.cloud[..., :] *
                                       self.scales[:, None, None])
+                if self.initial_cloud is not None:
+                    self.initial_cloud = (
+                        self.initial_cloud * self.scales[:, None, None])
             if cfg.goal_type == 'stable':
                 poses = self.stable_poses.clone()
                 table_h = cfg.table_dims[-1]
@@ -780,10 +808,14 @@ class TableTopWithObjectScene(TableTopScene):
                 #    nxt_patch_centers = self.patch_centers[lut_indices]
             if cfg.load_bbox:
                 nxt_bboxes = self.bboxes[lut_indices]
+            nxt_initial_cloud = None
             if cfg.load_cloud:
                 nxt_cloud = self.cloud[lut_indices]
                 if cfg.load_normal:
                     nxt_normal = self.normal[lut_indices]
+                nxt_initial_cloud = (
+                    self.initial_cloud[lut_indices]
+                    if self.initial_cloud is not None else None)
             if cfg.load_predefined_goal:
                 nxt_predefined_goal = self.predefined_goal[lut_indices]
 
@@ -883,6 +915,8 @@ class TableTopWithObjectScene(TableTopScene):
                     self.cur_cloud[env_ids] = nxt_cloud
                     if cfg.load_normal:
                         self.cur_normal[env_ids] = nxt_normal
+                    if nxt_initial_cloud is not None:
+                        self.cur_initial_cloud[env_ids] = nxt_initial_cloud
 
                 if (cfg.load_predefined_goal and
                         nxt_predefined_goal.shape[0] > 0):
@@ -916,6 +950,9 @@ class TableTopWithObjectScene(TableTopScene):
                     self.cur_cloud = nxt_cloud
                     if cfg.load_normal:
                         self.cur_normal = nxt_normal
+                    self.cur_initial_cloud = (
+                        nxt_initial_cloud if nxt_initial_cloud is not None
+                        else None)
 
                 if cfg.use_dr:
                     self.cur_object_friction = nxt_object_friction
@@ -1423,6 +1460,15 @@ class TableTopWithObjectScene(TableTopScene):
             if cfg.load_normal:
                 self.normal = convert({k: self.meta.normal(k)
                                        for k in self.keys})
+            # 离线 canonical 点云（如 PhyBlock 预处理），供 initial_cloud 使用
+            if getattr(self.meta, 'canonical_clouds', None):
+                self.initial_cloud = _canonical_clouds_to_tensor(
+                    self.keys,
+                    self.meta.canonical_clouds,
+                    INITIAL_CLOUD_SIZE,
+                    env.device)
+            else:
+                self.initial_cloud = None
         if cfg.load_predefined_goal:
             self.predefined_goal = convert(
                 {k: self.meta.predefined_goal(k) for k in self.keys})

@@ -397,6 +397,8 @@ class ICPNet(nn.Module):
         if filename is not None:
             if not Path(filename).exists():
                 filename = last_ckpt(filename)
+            if filename is None:
+                return
             params = th.load(filename, map_location='cpu')
             if "model_state_dict" in params:
                 params = params["model_state_dict"]
