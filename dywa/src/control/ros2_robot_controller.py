@@ -37,6 +37,10 @@ class Ros2RobotController:
     依赖：
     - 运行时需要 `rclpy`, `geometry_msgs`, `std_msgs`；
       如启用 action 夹爪，则需要 `control_msgs`。
+
+    下游控制器要求：
+    - 必须存在一个笛卡尔控制器订阅 `cfg.ee_target_topic`（默认 `/ee_target_pose`），
+      消息类型为 `geometry_msgs/PoseStamped`，并将该 pose 解释为 `cfg.base_frame`（默认 `world`）坐标系下的末端目标。
     """
 
     def __init__(self, cfg: Ros2RobotControllerConfig):

@@ -3,26 +3,26 @@
 # import os
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
+from pathlib import Path
 from typing import Optional
 import einops
 
 import torch as th
 
-if False:
-    # JIT
+try:
+    from cxx.ur5_kin_cuda import forward as ur5_ik
+except ModuleNotFoundError:
+    # 未 pip install 编译扩展时，用 JIT 从 dywa/c_src 编译
     from torch.utils.cpp_extension import load
-    from util.path import get_path
-    d = get_path('../../../')
-
+    _dywa_root = Path(__file__).resolve().parents[3]  # robot -> env -> src -> dywa
+    _c_src = _dywa_root / 'c_src'
     ur5_ik = load(
         name='ur5_ik_cuda',
         sources=[
-            F'{d}/ur5_kin_cuda.cpp',
-            F'{d}/ur5_kin_cuda_kernel.cu'],
+            str(_c_src / 'ur5_kin_cuda.cpp'),
+            str(_c_src / 'ur5_kin_cuda_kernel.cu'),
+        ],
         verbose=True)
-else:
-    # COMPILED
-    from cxx.ur5_kin_cuda import forward as ur5_ik
 
 
 def ur5_fk(q: th.Tensor, T: Optional[th.Tensor] = None) -> th.Tensor:

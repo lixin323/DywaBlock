@@ -62,19 +62,8 @@ def load_ckpt(modules: Dict[str, Union[dict, th.nn.Module]],
             m = m.module
         try:
             if isinstance(m, th.nn.Module):
-                state_to_load = save_dict[k]
-                if not strict:
-                    # strict=False: also skip keys with shape mismatch (PyTorch only ignores extra/missing keys)
-                    model_state = m.state_dict()
-                    state_to_load = {
-                        key: state_to_load[key]
-                        for key in state_to_load
-                        if key in model_state and state_to_load[key].shape == model_state[key].shape
-                    }
-                    skipped = set(save_dict[k].keys()) - set(state_to_load.keys())
-                    if skipped:
-                        print(F'load_ckpt (non-strict): skipped {len(skipped)} keys (missing or shape mismatch): {sorted(skipped)[:10]}{"..." if len(skipped) > 10 else ""}')
-                m.load_state_dict(state_to_load, strict=strict)
+                m.load_state_dict(save_dict[k],
+                                  strict=strict)
             else:
                 m.load_state_dict(save_dict[k])
         except KeyError as e:
@@ -90,7 +79,7 @@ def last_ckpt(root: Union[str, PathLike, Path],
 
     # By default, sort by file modification time.
     if key is None:
-        lambda f: f.stat().st_mtime
+        key = lambda f: f.stat().st_mtime
 
     path = Path(root)
     if path.is_file():
@@ -99,12 +88,15 @@ def last_ckpt(root: Union[str, PathLike, Path],
     try:
         last_ckpt = max(path.rglob(pattern), key=key)
     except ValueError:
-        # Empty sequence: no files matched. Fallback to huggingface only if repo:name format.
-        s = str(root)
-        if ':' in s:
-            repo_id, ckpt_name = s.split(':', maxsplit=1)
+        root_str = str(root)
+        # Fallback to huggingface (format: "<repo_id>:<filename or pattern>")
+        if ':' in root_str:
+            repo_id, ckpt_name = root_str.split(':', maxsplit=1)
             last_ckpt = hf_hub_download(repo_id, ckpt_name)
         else:
-            return None
+            raise FileNotFoundError(
+                f"Could not find any checkpoint matching pattern '{pattern}' under '{path.resolve()}'. "
+                "If you intended to load from HuggingFace, pass '<repo_id>:<filename_or_pattern>'."
+            )
 
     return last_ckpt

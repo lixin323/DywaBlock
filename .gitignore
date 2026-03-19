@@ -305,9 +305,10 @@ events.*
 
 
 ### data
+franka_deploy_0128_ee
 Dywa_abs_1view
 data
-dywa-origin
+dywa-changed
 corn
 docker/Downloads
 docker/*whl

@@ -946,35 +946,6 @@ def load_agent(cfg, env, path, writer):
     return agent
 
 
-def _infer_resume_step(load_ckpt_root: str) -> int:
-    """
-    Infer the last completed global step from a checkpoint root.
-
-    `load_ckpt_root` is expected to be a directory like:
-      .../run-001/ckpt
-
-    We intentionally do NOT rely on `last.ckpt` (it doesn't encode step).
-    Instead, we parse the max `step-*.ckpt` present in that directory.
-    """
-    try:
-        ckpt_path = Path(load_ckpt_root)
-        if ckpt_path.is_file():
-            s = step_from_ckpt(str(ckpt_path))
-            if s == float('inf') or s < 0:
-                return 0
-            return int(s)
-        if not ckpt_path.is_dir():
-            return 0
-        steps = []
-        for p in ckpt_path.glob('step-*.ckpt'):
-            s = step_from_ckpt(str(p))
-            if s != float('inf') and s >= 0:
-                steps.append(int(s))
-        return max(steps) if steps else 0
-    except Exception:
-        return 0
-
-
 def eval_agent_inner(cfg: Config, return_dict):
     # [1] Silence outputs during validation.
     import sys
@@ -1064,22 +1035,12 @@ def inner_main(cfg: Config, env, path):
     but we commit the config _after_ finalizing.
     """
     commit_hash = assert_committed(force_commit=cfg.force_commit)
-    resume_step = 0
-    if cfg.load_ckpt is not None:
-        resume_step = _infer_resume_step(cfg.load_ckpt)
-    writer = SummaryWriter(
-        path.tb_train,
-        purge_step=(resume_step + 1) if resume_step > 0 else None
-    )
+    writer = SummaryWriter(path.tb_train)
     writer.add_text('meta/commit-hash',
                     str(commit_hash),
                     global_step=0)
     env.unwrap(target=AddTensorboardWriter).set_writer(writer)
     agent = load_agent(cfg, env, path, writer)
-    if cfg.load_ckpt is not None:
-        # Continue global step counter from the checkpoint directory.
-        # This prevents TB/ckpt step indices from restarting at 0 on resume.
-        agent.run_step = int(resume_step + 1)
 
     # Enable DataParallel() for subset of modules.
     if (cfg.parallel is not None) and (th.cuda.device_count() > 1):

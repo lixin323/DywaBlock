@@ -1,0 +1,23 @@
+cd /home/user/DyWA/dywa/exp/train
+PYTORCH_JIT=0 python3 test_rma.py \
+  +platform=debug \
+  +env=phyblock_abs_goal_1view \
+  +run=teacher_base \
+  +student=dywa/base \
+  ++name=dywa_abs_1view \
+  ++path.root=/home/user/DyWA/output/eval_phyblock_unseen_obj \
+  ++env.num_env=60 \
+  ++global_device=cuda:0 \
+  ++student.norm=ln \
+  +load_student=/home/user/DyWA/Dywa_abs_1view/ckpt/last.ckpt \
+  ++load_ckpt=/home/user/DyWA/Dywa_abs_1view/ckpt \
+  ++train_student_policy=true \
+  ++use_icp_obs=false \
+  ++plot_pc=0 \
+  ++dagger_train_env.anneal_step=1 \
+  ++add_teacher_state=1 \
+  ++student.decoder.film_mlp=1 \
+  ++monitor.num_env_record=60 \
+  ++env.single_object_scene.mode=valid \
+  ++env.single_object_scene.filter_file=null \
+  ++log_categorical_results=true

@@ -38,7 +38,6 @@ from env.util import (
     draw_cloud_with_sphere,
     draw_patch_with_cvxhull
 )
-from models.rl.net.no_op import NoOpFeatNet, NoOpAggNet
 from train.ckpt import (
     last_ckpt, step_from_ckpt,
     save_ckpt
@@ -145,12 +144,6 @@ def update_net_cfg(base_net_cfg,
                    env,
                    blocklist=None,
                    allowlist=None):
-    """
-    从 env.observation_space 推导 NetworkConfig 所需的 obs_space / act_space。
-    额外处理：当仅使用 student_state 作为输入训练学生策略时，为其补上默认的
-    feature/aggregator 配置，避免 generic_state_encoder 在 map_struct 时遇到
-    (src, dst) = ((128,), None) 这样的非法组合。
-    """
     obs_space = map_struct(
         env.observation_space,
         lambda src, _: src.shape,
@@ -166,42 +159,6 @@ def update_net_cfg(base_net_cfg,
     if blocklist is not None:
         for key in blocklist:
             obs_space.pop(key, None)
-
-    # 若只保留了 student_state（用于学生策略），需要为其补全特征/聚合/fuser 配置，
-    # 否则 generic_state_encoder 前向时会因 fuser.keys 仍为 ['icp_emb'] 而 KeyError。
-    if 'student_state' in obs_space:
-        state_cfg = base_net_cfg.state
-        feat = dict(state_cfg.feature)
-        agg = dict(state_cfg.aggregator)
-        if 'student_state' not in feat:
-            feat['student_state'] = NoOpFeatNet.Config(
-                dim_in=obs_space['student_state'],
-                dim_out=obs_space['student_state'][0],
-            )
-        if 'student_state' not in agg:
-            agg['student_state'] = NoOpAggNet.Config(
-                dim_obs=obs_space['student_state'],
-                dim_out=obs_space['student_state'][0],
-            )
-        # 同步 fuser：keys 必须与当前 obs_space 一致，否则前向时 th.cat([x[k] for k in self.keys]) 会 KeyError。
-        # MLP 的 dim_in 由 MLPFuser 构造时根据 aggregator.dim_out 与 keys 自动推导。
-        fuser_cfg = getattr(state_cfg, 'fuser', None)
-        target_keys = tuple(obs_space.keys())
-        if fuser_cfg is not None and hasattr(fuser_cfg, 'keys'):
-            current_keys = fuser_cfg.keys
-            if current_keys is None:
-                need_sync = True
-            else:
-                current_keys = tuple(current_keys)  # 兼容 list（如 YAML 的 ['icp_emb']）
-                need_sync = current_keys != target_keys or any(
-                    k not in obs_space for k in current_keys)
-            if need_sync:
-                fuser_cfg = replace(fuser_cfg, keys=target_keys)
-        state_repl = replace(state_cfg, feature=feat, aggregator=agg)
-        if fuser_cfg is not None:
-            state_repl = replace(state_repl, fuser=fuser_cfg)
-        base_net_cfg = replace(base_net_cfg, state=state_repl)
-
     print('obs_space', obs_space)
     print('base_net', base_net_cfg)
     dim_act = (
@@ -216,8 +173,9 @@ def update_net_cfg(base_net_cfg,
 def get_config_path():
     if Path('/home/user/mambaforge').exists():
         return '/home/user/mambaforge/envs/genom/lib/python3.8/site-packages/data/cfg/'
-    else:
-        return '../../src/data/cfg/'
+    # 用脚本位置推导 cfg 的绝对路径，避免 Hydra 把相对路径解析成包名 dywa-origin.src.data.cfg
+    _dir = Path(__file__).resolve().parent  # exp/train
+    return str((_dir / '../../src/data/cfg').resolve())
 
 @hydra_cli(
     config_path=get_config_path(),
@@ -376,7 +334,6 @@ def main(cfg: Config):
         student_policy_cfg = replace(
             cfg, net=update_net_cfg(
                 cfg.net, env, allowlist=['student_state']),
-            load_ckpt_strict=False,  # allow loading when net differs (e.g. no icp_emb)
             # NOTE: we explicitly disable student policy loading.
             # load_ckpt=None,
             # transfer_ckpt=None
@@ -387,10 +344,9 @@ def main(cfg: Config):
                                     writer)
         if hasattr(env, 'save'):
             stat_ckpt = last_ckpt(cfg.load_ckpt + "_stat")
-            if stat_ckpt is not None:
-                print(F'Also loading env stats from {stat_ckpt}')
-                env.load(stat_ckpt,
-                         strict=False)
+            print(F'Also loading env stats from {stat_ckpt}')
+            env.load(stat_ckpt,
+                     strict=False)
         export_cfg()
 
         ic(student_policy)

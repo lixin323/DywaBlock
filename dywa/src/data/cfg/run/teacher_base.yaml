@@ -12,7 +12,7 @@ icp_obs:
   icp:
     keys:
       hand_state: 9
-    ckpt: '/home/user/DyWA/ckpts/512-32-balanced-SAM-wd-5e-05-920'
+    ckpt: '/home/user/DyWA/Dywa_abs_1view/ckpt'
 
 net:
   state:

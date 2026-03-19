@@ -395,23 +395,56 @@ class ICPNet(nn.Module):
 
     def load(self, filename=None, params=None, verbose=False):
         if filename is not None:
-            if not Path(filename).exists():
+            p = Path(filename)
+            if (not p.exists()) or p.is_dir():
                 filename = last_ckpt(filename)
-            if filename is None:
-                return
-            params = th.load(filename, map_location='cpu')
-            if "model_state_dict" in params:
-                params = params["model_state_dict"]
+                p = Path(filename)
+            if p.is_dir():
+                raise FileNotFoundError(
+                    f"ICP ckpt resolved to a directory: '{p}'. "
+                    "Point `icp_obs.icp.ckpt` to a checkpoint file or a directory containing '*.ckpt'."
+                )
+            raw = th.load(str(p), map_location='cpu')
+
+            # Common formats we support:
+            # 1) Our native format from `ICPNet.save()`:
+            #    {'patch_encoder','pos_embed','tokenize','encoder','header'}
+            # 2) Lightning-like format:
+            #    {'state_dict': {...}} or {'model_state_dict': {...}}
+            # 3) Training wrapper format:
+            #    {'model': <native or flat state dict>}
+            params = raw
+            if isinstance(raw, dict):
+                if 'model' in raw:
+                    params = raw['model']
+                elif 'model_state_dict' in raw:
+                    params = raw['model_state_dict']
+                elif 'state_dict' in raw:
+                    params = raw['state_dict']
+
+            if not isinstance(params, dict):
+                raise KeyError(
+                    f"Unsupported ICP checkpoint format in '{p}': "
+                    f"expected a dict, got {type(params)}"
+                )
+
+            native_keys = {'patch_encoder', 'pos_embed', 'tokenize', 'encoder', 'header'}
+            if native_keys.issubset(set(params.keys())):
+                # Native format: continue to load below.
+                pass
             else:
-                params = params['model']
-                output = transfer(self, params,
-                                  prefix_map={
-                                      'tokenizes.hand': 'tokenizes.hand_state',
-                                      'encoder.': '',
-                                  },
-                                  verbose=True
-                                  )
-                ic(output)
+                # Try treating `params` as a flat state_dict (e.g. Lightning) and map keys.
+                output = transfer(
+                    self, params,
+                    prefix_map={
+                        'tokenizes.hand': 'tokenizes.hand_state',
+                        'encoder.': '',
+                    },
+                    verbose=bool(verbose),
+                )
+                if verbose:
+                    ic({'ckpt': str(p), 'top_keys': list(raw.keys()) if isinstance(raw, dict) else None})
+                    ic(output)
                 return
         else:
             assert (params is not None)

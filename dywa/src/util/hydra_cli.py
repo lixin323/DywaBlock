@@ -80,13 +80,18 @@ def hydra_cli(
                     .format(sig))
 
         # NOTE: using @wraps to forward main() documentation.
-        # NOTE: hydra only works with relative path...
-        rel_path: str = os.path.relpath(config_path,
-                                        start=Path(__file__).parent.resolve())
+        # Resolve relative config paths against the decorated entrypoint's file.
+        # Resolving against `util/` (this file) can make Hydra interpret the path
+        # as a package module like `dywa-origin.src.data.cfg`.
+        if os.path.isabs(config_path):
+            abs_config_path = config_path
+        else:
+            entry_file = Path(inspect.getfile(main)).resolve()
+            abs_config_path = str((entry_file.parent / config_path).resolve())
 
         @wraps(main)
         @hydra.main(
-            config_path=rel_path,
+            config_path=abs_config_path,
             config_name=config_name,
             version_base=None)
         def wrapper(cli_cfg: DictConfig):

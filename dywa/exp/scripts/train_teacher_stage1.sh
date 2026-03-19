@@ -3,6 +3,7 @@ cd dywa/exp/train
 
 name='film_mlp'
 root="/home/user/DyWA/output/dywa"
+export PYTHONPATH="/home/user/DyWA/dywa/src:${PYTHONPATH}"
 
 if [ ! -d "${root}/${name}" ]; then
 mkdir -p "${root}/${name}"

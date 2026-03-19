@@ -3,6 +3,7 @@ cd dywa/exp/train
 
 # Docker 内路径映射后一般为 /home/user/DyWA；宿主机可 export DYWA_ROOT 覆盖
 DYWA_ROOT="${DYWA_ROOT:-/home/user/DyWA}"
+export PYTHONPATH="${DYWA_ROOT}/dywa/src:${PYTHONPATH}"
 name='dywa'
 root="${DYWA_ROOT}/output/test_rma"
 TEACHER_CKPT_DIR="${DYWA_ROOT}/Dywa_abs_1view/ckpt"

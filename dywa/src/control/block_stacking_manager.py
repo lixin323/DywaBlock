@@ -228,6 +228,9 @@ class BlockStackingManager:
         grasp_planner: Optional[GraspPlanner] = None,
         *,
         scene_extension: str = ".json",
+        pos_tol_m: float = 5e-3,
+        ang_tol_rad: float = 5.0 / 180.0 * np.pi,
+        max_adjust_steps: int = 128,
     ):
         """
         参数
@@ -252,6 +255,9 @@ class BlockStackingManager:
         self.dywa = dywa_policy
         self.robot = robot
         self.grasp_planner = grasp_planner
+        self.pos_tol_m = float(pos_tol_m)
+        self.ang_tol_rad = float(ang_tol_rad)
+        self.max_adjust_steps = int(max_adjust_steps)
 
     # --------------------------------------------------------------------- #
     # 公共 API
@@ -307,8 +313,10 @@ class BlockStackingManager:
         # 2) 使用 DyWA 在“工作区域”内将积木调整到目标姿态
         self.dywa.reset_episode()
         current_T = current_T_world_block
-        for _ in range(128):
-            if self._is_pose_close(current_T, block.target_T_world_block):
+        reached = False
+        for _ in range(self.max_adjust_steps):
+            if self._is_pose_close(current_T, block.target_T_world_block, pos_tol=self.pos_tol_m, ang_tol=self.ang_tol_rad):
+                reached = True
                 break
 
             action = self.dywa.compute_action(
@@ -322,6 +330,14 @@ class BlockStackingManager:
             current_T = self.linemod.estimate_pose(
                 block_type=block.type,
                 color=block.color,
+            )
+
+        if not reached and not self._is_pose_close(
+            current_T, block.target_T_world_block, pos_tol=self.pos_tol_m, ang_tol=self.ang_tol_rad
+        ):
+            dp = float(np.linalg.norm(np.asarray(current_T, dtype=np.float32)[:3, 3] - np.asarray(block.target_T_world_block, dtype=np.float32)[:3, 3]))
+            raise RuntimeError(
+                f"DyWA 调整未收敛: block={block.type}_{block.color}, steps={self.max_adjust_steps}, pos_err={dp:.4f}m"
             )
 
         # 3) 到达目标工作区域后，利用几何解析法生成抓取点并完成抓取
@@ -356,12 +372,29 @@ class BlockStackingManager:
         block: BlockSpec,
     ) -> None:
         """执行实际抓取动作."""
-        # 先张开夹爪
-        self.robot.set_gripper(gripper_width)
-        # 移动到抓取位姿
-        self.robot.move_ee_to_pose(T_world_ee)
-        # 闭合夹爪绑定积木
-        self.robot.attach_object(block.type)
+        # 基本 pick 序列：pre_grasp -> grasp -> close -> lift
+        T = np.asarray(T_world_ee, dtype=np.float32)
+        # 约定世界系 z 轴向上；若你的 base_frame 不同，请在上层统一（例如把 table_normal_world 作为参数传入）
+        z_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+        pre_grasp_offset = 0.10
+        lift_offset = 0.15
+
+        T_pre = T.copy()
+        T_pre[:3, 3] = T_pre[:3, 3] + pre_grasp_offset * z_up
+        T_lift = T.copy()
+        T_lift[:3, 3] = T_lift[:3, 3] + lift_offset * z_up
+
+        # 1) 打开夹爪到略大于物体宽度
+        self.robot.set_gripper(float(gripper_width))
+        # 2) 预抓取位姿
+        self.robot.move_ee_to_pose(T_pre)
+        # 3) 下探到抓取位姿
+        self.robot.move_ee_to_pose(T)
+        # 4) 闭合夹爪（实机通常需要设置到接近 0，具体取决于夹爪控制器）
+        self.robot.set_gripper(0.0)
+        # 5) 抬起
+        self.robot.move_ee_to_pose(T_lift)
 
     @staticmethod
     def _is_pose_close(
