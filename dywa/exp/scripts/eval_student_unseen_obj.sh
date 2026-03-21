@@ -4,6 +4,7 @@ cd dywa/exp/train
 # Docker 内路径映射后一般为 /home/user/DyWA；宿主机可 export DYWA_ROOT 覆盖
 DYWA_ROOT="${DYWA_ROOT:-/home/user/DyWA}"
 export PYTHONPATH="${DYWA_ROOT}/dywa/src:${PYTHONPATH}"
+BLOCK_DGN_ROOT="${DYWA_ROOT}/block_data_DGN"
 name='dywa'
 root="${DYWA_ROOT}/output/test_rma"
 TEACHER_CKPT_DIR="${DYWA_ROOT}/Dywa_abs_1view/ckpt"
@@ -29,8 +30,11 @@ PYTORCH_JIT=0 python3 test_rma.py \
 ++dagger_train_env.anneal_step=1 \
 ++add_teacher_state=1 \
 ++student.decoder.film_mlp=1 \
-++env.single_object_scene.filter_file=${DYWA_ROOT}/Dywa_abs_1view/test_set.json \
+++env.single_object_scene.dgn.data_path="${BLOCK_DGN_ROOT}/meta-v8" \
+++env.single_object_scene.dgn.pose_path="${BLOCK_DGN_ROOT}/meta-v8/unique_dgn_poses" \
+++env.single_object_scene.filter_file="${BLOCK_DGN_ROOT}/test_set.json" \
 ++monitor.num_env_record=60 \
 ++env.single_object_scene.mode=valid \
 ++log_categorical_results=True \
+++export_cfg_dir="${DYWA_ROOT}/exported_abs_goal_1view" \
 # &> "$root/$name/out.out"

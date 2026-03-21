@@ -1,0 +1,187 @@
+dim_in: []
+dim_out: -1
+horizon: 1
+p_drop: 0.0
+num_layer: 2
+pos_embed_type: mlp
+patch_type: mlp
+batch_size: 60
+action_size: 20
+max_delay_steps: 0
+estimate_level: action
+without_teacher: false
+use_gpcd: true
+use_interim_goal: true
+ckpt: null
+state_keys:
+- abs_goal
+- hand_state
+- robot_state
+- previous_action
+learning_rate: 0.0006
+loss_type: KLDiv
+use_triplet_loss: false
+use_amp: false
+norm: ln
+embed_size: 128
+shapes:
+  goal: 9
+  hand_state: 9
+  robot_state: 14
+  previous_action: 20
+  abs_goal: 9
+  rel_goal: 9
+state_tokenizer_activate: false
+state_tokenizer_hiddens: null
+point_tokenizer:
+  encode_patch: true
+  patch_encoder_type: pointnet
+  patch_encoder_mlps:
+  - - 32
+  - - 128
+  patch_nums:
+  - 64
+  - 16
+  K_nn: 32
+  pn_cfg: null
+  num_tokens: 16
+  token_pe: false
+  pos_embed_type: mlp
+encoder:
+  self_atten:
+    layer:
+      attention:
+        linear_proj: true
+        self_attn:
+          hidden_size: 128
+          num_attention_heads: 4
+          qkv_bias: true
+          attention_probs_dropout_prob: 0.0
+          linear_proj: true
+        output:
+          hidden_size: 128
+          hidden_dropout_prob: 0.0
+      intermediate:
+        hidden_size: 128
+        intermediate_size: 128
+        hidden_act: gelu
+      output:
+        intermediate_size: 128
+        hidden_size: 128
+        hidden_dropout_prob: 0.0
+      hidden_size: 128
+      layer_norm_eps: 1.0e-06
+      use_adapter: false
+      adapter_dim: 64
+    num_hidden_layers: 2
+    use_adapter: false
+  encoder_type: mlp
+  encoder_mlp:
+  - 1024
+  - 1024
+  res_link: true
+decoder:
+  decoder_type: film
+  cross_atten:
+    num_hidden_layers: 6
+    layer:
+      embed_size: 128
+      num_heads: 4
+      softmax_scale: null
+      attention_dropout: 0.0
+      ffn_dropout: 0.1
+  decoder_mlp:
+  - 2368
+  res_link: false
+  learnable_query: null
+  num_query_tokens: 37
+  film_pred_scale: true
+  film_mlp: true
+  kernel_stride_list: null
+vision_pose_predictor:
+  dim_in: []
+  dim_out: -1
+  xyz_loss_coef: 1.0
+  rot_loss_coef: 1.0
+  xyz_loss_type: MSE
+  rot_loss_type: l1
+  xyz_dim: 3
+  rot_dim: 9
+  input: vision
+  pose_mlp_states: []
+  xyz_mlp_states:
+  - 128
+  - 64
+  rot_mlp_states:
+  - 128
+  - 64
+  state_size: 256
+merge_pose_pred: false
+aggregator:
+  aggregator_type: mlp
+  state_size: 256
+  aggregator_mlp:
+  - 1024
+  - 256
+  num_gru_layer: null
+use_history: true
+history_tokenizer:
+  encoder:
+    self_atten:
+      layer:
+        attention:
+          linear_proj: true
+          self_attn:
+            hidden_size: 128
+            num_attention_heads: 4
+            qkv_bias: true
+            attention_probs_dropout_prob: 0.0
+            linear_proj: true
+          output:
+            hidden_size: 128
+            hidden_dropout_prob: 0.0
+        intermediate:
+          hidden_size: 128
+          intermediate_size: 128
+          hidden_act: gelu
+        output:
+          intermediate_size: 128
+          hidden_size: 128
+          hidden_dropout_prob: 0.0
+        hidden_size: 128
+        layer_norm_eps: 1.0e-06
+        use_adapter: false
+        adapter_dim: 64
+      num_hidden_layers: 2
+      use_adapter: false
+    encoder_type: Identity
+    encoder_mlp: null
+    res_link: false
+  decoder:
+    decoder_type: conv
+    cross_atten:
+      num_hidden_layers: 6
+      layer:
+        embed_size: 128
+        num_heads: 4
+        softmax_scale: null
+        attention_dropout: 0.0
+        ffn_dropout: 0.1
+    decoder_mlp: null
+    res_link: false
+    learnable_query: null
+    num_query_tokens: 1
+    film_pred_scale: false
+    film_mlp: false
+    kernel_stride_list:
+    - - 17
+      - 17
+    - - 2
+      - 1
+  history_len: 5
+  num_envs: 512
+constraint:
+  loss_coef: 1.0
+  margin: 1.0
+  loss_type: contrastive
+  dim: 128

@@ -1,80 +1,160 @@
-# plan.md: DywaBlock 真机部署与代码实现计划
+# DyWA 真机部署计划（2026-03-19 更新）
 
-## 1. 项目概览
-本项目旨在利用 DyWA（Dynamic World Alignment）策略，在 Franka Panda 机器人上实现自动化积木堆叠。
-- **核心逻辑**：基于点云对齐的非合拢操控（Push）+ 几何抓取（Pick & Place）。
-- **关键挑战**：Sim-to-Real 的坐标对齐、多物体场景下的点云遮罩（Masking）、复杂形状的抓取规划。
+## 1. 当前目标（已落地）
 
----
+保持最短链路、无占位、点云全链路闭环：
 
-## 2. 模块化开发路线
-
-### M1: 数据预处理（Template Generation）
-**目标**：为 LINEMOD 识别生成 6D 位姿匹配模板。
-- **任务**：编写 `generate_templates.py`。
-- **逻辑**：利用 `block_assets` 中的 OBJ 文件，通过球形采样渲染 RGBD 图像，提取 LINEMOD 特征并记录相对位姿。
-
-### M2: 视觉感知模块（Masked Perception）
-**目标**：在多物体桌面识别目标积木，并提取纯净的点云。
-- **任务**：完善 `linemod_opencv.py`。
-- **核心点**：
-    - 返回目标积木的 `SE3` 位姿和像素级 `Mask`。
-    - **点云提取**：结合深度图与 Mask，提取目标积木的当前点云 $PC_{curr}$。
-    - **位姿精炼**：使用 Open3D 的 Point-to-Plane ICP 对识别出的位姿进行毫米级微调。
-
-### M3: DyWA 位姿调整器（Point Cloud Adjuster）
-**目标**：调用点云 RL 模型，将积木调整至理想抓取姿态。
-- **任务**：编写 `pose_adjuster.py`。
-- **输入对齐**：
-    - `Input A`: 实时 Mask 提取的点云 $PC_{curr}$。
-    - `Input B`: 将 OBJ 模型变换至 `goal_pose` 得到的虚拟点云 $PC_{goal}$。
-- **控制循环**：模型输出 Push 动作 -> 机械臂执行 -> 视觉反馈 -> 循环直到 Chamfer Distance 达标。
-
-### M4: 几何解析抓取规划（Grasp Planner）
-**目标**：针对不同形状（正方体、半圆柱、三角柱）自动计算抓取点。
-- **任务**：编写 `grasp_planner.py`。
-- **形状策略**：
-    - **正方体**：平行侧面中心抓取。
-    - **半圆柱**：端面优先，或底面垂直夹持。
-    - **三角柱**：端面夹持，或侧面二等分线对角夹持。
-
-### M5: 系统集成与堆叠逻辑（Master Executor）
-**目标**：读取 GT 任务，驱动 Franka 完成流水线。
-- **任务**：编写 `main_stacking_executor.py`。
-- **逻辑**：解析顺序 -> 视觉定位 -> DyWA 调整 -> 抓取 -> 堆叠（根据层数动态计算 Z 轴 Offset）。
+1. 读取 GT 目标块序列  
+2. 真机上传 RGB-D + EE 状态 + `T_base_cam`  
+3. Server 侧 LINEMOD + 点云得到 `current_T_world_block` / `partial_cloud_world`  
+4. DyWA Student（对齐评估语义）输出调整目标  
+5. 几何抓取模块生成 `pre/grasp/lift` 动作序列  
+6. Server 状态机按阈值推进 `ADJUST -> GRASPED -> next block`
 
 ---
 
-## 3. 实现步骤与 Cursor Prompt 序列
+## 2. 代码结构（当前有效）
 
-### 第一阶段：视觉与基础控制
-1. **Prompt 1 (Templates)**：
-   > “阅读 `block_assets/` 中的 OBJ。编写 `generate_templates.py`，使用 Open3D 渲染各视角并为每种积木生成 OpenCV LINEMOD 模板存入 `linemod_templates/`。”
-2. **Prompt 2 (Perception)**：
-   > “完善 `linemod_opencv.py`。实现 `detect_and_mask` 函数，要求在识别位姿的同时返回像素 Mask，并利用 Mask 提取 1024 个点的目标物点云。”
+### 2.1 流程编排
+- `dywa/src/control/stacking_pipeline.py`
+- 入口：`BlockStackingPipeline.process_request(req)`
+- 负责：状态机、模块调用顺序、返回 `actions/phase/block_index`
 
-### 第二阶段：DyWA 策略对齐
-3. **Prompt 3 (Adjustment)**：
-   > “编写 `pose_adjuster.py`。它应加载 DyWA 点云策略模型。输入是 Mask 提取的实时点云和目标位姿下的模型点云。输出是 Push 动作，通过 `Ros2RobotController` 执行。”
+### 2.2 WebSocket 服务入口
+- `dywa/src/control/dywa_policy_server.py`
+- 只做协议收发 + 异常封装
+- 配置项：`dywa_export_dir`（已替换旧 `dywa_ckpt`）
 
-### 第三阶段：抓取与堆叠执行
-4. **Prompt 4 (Grasping)**：
-   > “实现 `grasp_planner.py`。针对 Cube, Semi-cylinder, Triangular Prism 实现几何法抓取点计算，返回 [pre_grasp, grasp, lift_up] 序列。”
-5. **Prompt 5 (Main)**：
-   > “集成所有模块至 `main_stacking_executor.py`。读取 `SCENEs_400_Goal_Jsons/`，按照顺序执行堆叠任务。加入手眼标定矩阵变换逻辑，将相机系坐标转换为机器人基座系。”
+### 2.3 感知与任务
+- `dywa/src/control/gt_task_reader.py`：读取 `SCENEs_400_Goal_Jsons/{scene_id:03d}.json`
+- `dywa/src/control/pose_recognition_module.py`：解码 RGB-D + LINEMOD + 点云
+
+### 2.4 调整与抓取
+- `dywa/src/control/dywa_adjust_module.py`：DyWA 调整 chunk（夹爪保持打开）
+- `dywa/src/control/grasp_point_module.py`：几何抓取点生成
+- `dywa/src/control/grasp_action_module.py`：抓取动作序列（含 `gripper=1` 触发）
+
+### 2.5 Student 部署适配（重点）
+- `dywa/src/control/dywa_model_policy.py`
+- 已切换为“导出资产驱动”：
+  - 读取 `export_dir/student.yaml` + `student.ckpt`
+  - 读取 `export_dir/normalizer.yaml` + `normalize.ckpt`
+  - 观测 key 对齐 `eval_student_unseen_obj.sh` 语义：`abs_goal/hand_state/robot_state/previous_action/partial_cloud(+goal_cloud)`
+  - 覆盖关键语义：`student.norm="ln"`、`student.decoder.film_mlp=1`
 
 ---
 
-## 4. 真机部署关键检查清单
-- [ ] **手眼标定**：确保 $T_{base}^{cam}$ 精度在 2mm 以内。
-- [ ] **单位对齐**：检查点云单位（米 vs 毫米）是否与模型训练时一致。
-- [ ] **Mask 质量**：光照是否会导致 Mask 破碎？若有点云离群点，需加入离群点滤波。
-- [ ] **安全高度**：在 `lift_up` 和 `pre_place` 时，Z 轴高度需高于已有积木塔 10cm 以上。
+## 3. 协议（不变）
+
+### 请求（客户端 -> server）
+- `scene_id`
+- `ee_state` (7)
+- `image_width`, `image_height`
+- `fx`, `fy`, `cx`, `cy`
+- `depth_scale`
+- `T_base_cam` (4x4 行主序, 16 floats)
+- `rgb_jpeg_b64`
+- `depth_zlib_b64`
+
+### 响应（server -> 客户端）
+- `error`
+- `actions`（7维动作序列）
+- `scene_done`
+- `block_index`
+- `phase`
+- `pos_err_block_m`
+- `object_name`
 
 ---
 
-### 给 Cursor 的建议：
-在开始写代码前，请先运行：
-1. `se3.py`：熟悉位姿变换工具类。
-2. `config.py`：确定参数读取方式。
-3. `franka_control_node.py`：熟悉真机 ROS2 接口。
+## 4. 阈值语义（server 侧）
+
+- `grasp_tol_m`：  
+  `ADJUST` 阶段当 `translation error < grasp_tol_m` 时生成抓取序列并切换 `GRASPED`
+- `place_tol_m`：  
+  `GRASPED` 阶段当 `translation error < place_tol_m` 时 `block_index += 1` 并 reset DyWA episode
+
+---
+
+## 5. 已解决问题记录
+
+1. `ConfigKeyError: use_partial_cloud`  
+   - 处理：合并配置时允许非结构化 key（`hydra_cli.py`）
+
+2. `env-last.ckpt` 路径找不到  
+   - 处理：`test_rma.py` 支持 `load_student` 为目录或文件两种形式
+
+3. `replace() should be called on dataclass instances`  
+   - 处理：`dywa_model_policy.py` 中先将 `student.yaml` merge 到 `StudentAgentRMAConfig` structured base，再 `to_object` 生成 dataclass
+
+4. `history_tokenizer.history` shape mismatch (4096 vs 1)  
+   - 处理：加载 student.ckpt 时排除  
+   `history_tokenizer.history`、`aggregator.aggregator.memory`
+
+---
+
+## 6. 当前启动方式
+
+### 6.1 启动 server
+- 脚本：`start_dywa_policy_server.sh`
+- 默认从 `exported_abs_goal_1view` 读取部署模型资产
+
+### 6.2 真机侧 inference node
+- 文件：`franka_dywa_inference_node.py`
+- 必填：`--t-base-cam-csv`（16 个 float，行主序）
+
+---
+
+## 7. 下一步（立即执行）
+
+1. 在容器内重新启动 server，确认不再报 student 初始化错误  
+2. 用单次客户端请求验证返回非空 `actions`  
+3. 真机联调观察 `phase/block_index/pos_err_block_m` 是否按阈值推进
+
+---
+
+## 8. 维护约束
+
+1. 禁止回退到占位策略或“兼容补丁”路径。  
+2. 新逻辑只进对应模块，不在 `dywa_policy_server.py` 扩散业务实现。  
+3. 坐标系统一：`T_world_cam == T_base_cam`（由客户端提供并校验）。
+
+你现在部署里就固定用这三路：
+
+RGB: /camera2/camera2/color/image_raw
+Depth: /camera2/camera2/aligned_depth_to_color/image_raw
+CameraInfo: /camera2/camera2/color/camera_info
+内参用你刚回显的：
+
+fx=606.2757568359375
+fy=605.8397216796875
+cx=325.67181396484375
+cy=248.4153594970703
+标定矩阵是Translation
+	x: 0.335567
+	y: -0.329068
+	z: 0.710526)
+Rotation
+	x: -0.308546
+	y: 0.202531
+	z: 0.636822
+	w: 0.676933
+相机内参是侧边相机
+
+camera matrix
+611.023473 0.000000 330.929700
+0.000000 612.591246 247.915796
+0.000000 0.000000 1.000000
+
+distortion
+0.179206 -0.422968 -0.006947 0.007867 0.000000
+
+rectification
+1.000000 0.000000 0.000000
+0.000000 1.000000 0.000000
+0.000000 0.000000 1.000000
+
+projection
+620.669434 0.000000 334.781793 0.000000
+0.000000 625.729980 245.162042 0.000000
+0.000000 0.000000 1.000000 0.000000

@@ -32,5 +32,5 @@ net:
     state:
       dim_hidden: []
   
-load_ckpt: '/home/user/DyWA/output/dywa/teacher-stage2/run-000/ckpt/'
+load_ckpt: '/home/user/DyWA/Dywa_abs_1view/ckpt/teacher-last.ckpt'
 model_name: 'base_v2'

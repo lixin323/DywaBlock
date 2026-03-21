@@ -1,4 +1,273 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
+import asyncio
+import base64
+import dataclasses
+import json
+import threading
+import time
+import zlib
+from typing import Optional
+
+import cv2
+import numpy as np
+import pyrealsense2 as rs
+import rclpy
+import tyro
+import websockets
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool, Float32MultiArray
+
+
+@dataclasses.dataclass
+class Args:
+    # server
+    policy_server_host: str = "127.0.0.1"
+    policy_server_port: int = 33060
+    scene_id: int = 0
+    t_base_cam_csv: str = ""
+
+    # camera
+    cam_side_serial: str = "405622072640"
+    image_width: int = 640
+    image_height: int = 480
+    camera_fps: int = 30
+    jpeg_quality: int = 88
+
+    # loop
+    inference_frequency: float = 1.0
+    max_actions_to_publish: int = 20
+    action_publish_interval: float = 0.01
+    max_state_age: float = 0.2
+
+    # topics
+    ee_states_topic: str = "/franka/ee_states"
+    action_topic: str = "/franka/action_command"
+    queue_status_topic: str = "/franka/queue_status"
+    allow_inference_topic: str = "/franka/allow_inference"
+
+
+class FrankaDywaInferenceNode(Node):
+    """真机侧最小节点：采集 RGB-D + EE，向 server 请求动作，再发布 action_command。"""
+
+    def __init__(self, args: Args):
+        super().__init__("franka_dywa_inference_node")
+        self.args = args
+        self.ws_uri = f"ws://{args.policy_server_host}:{args.policy_server_port}"
+
+        self._T_base_cam_row = self._parse_t_base_cam(args.t_base_cam_csv)
+        self.get_logger().info(f"Policy Server: {self.ws_uri}")
+
+        self._state_lock = threading.Lock()
+        self._policy_lock = threading.Lock()
+        self._queue_lock = threading.Lock()
+
+        self.latest_ee: Optional[list[float]] = None
+        self.last_ee_time: float = 0.0
+        self.queue_empty: bool = False
+        self.allow_inference: bool = True
+        self.can_infer: bool = False
+
+        self._rgbd_payload: Optional[dict] = None
+        self._cam_fx = self._cam_fy = self._cam_cx = self._cam_cy = 0.0
+        self._depth_scale = 0.001
+
+        self.current_block_index = 0
+        self.current_phase = "ADJUST"
+        self.infer_count = 0
+
+        self._init_camera()
+        self._start_camera_thread()
+
+        self.ee_sub = self.create_subscription(JointState, args.ee_states_topic, self.ee_cb, 10)
+        self.queue_sub = self.create_subscription(Bool, args.queue_status_topic, self.queue_cb, 10)
+        self.allow_sub = self.create_subscription(Bool, args.allow_inference_topic, self.allow_cb, 10)
+        self.action_pub = self.create_publisher(Float32MultiArray, args.action_topic, 10)
+        self.timer = self.create_timer(1.0 / max(0.1, args.inference_frequency), self.inference_cb)
+
+    @staticmethod
+    def _parse_t_base_cam(csv: str) -> list[float]:
+        s = (csv or "").strip()
+        if not s:
+            raise ValueError("必须提供 --t-base-cam-csv（16个浮点数，行主序）")
+        arr = [float(x.strip()) for x in s.split(",")]
+        if len(arr) != 16:
+            raise ValueError(f"--t-base-cam-csv 需要16个数，收到 {len(arr)}")
+        return arr
+
+    def _init_camera(self) -> None:
+        W, H, fps = self.args.image_width, self.args.image_height, self.args.camera_fps
+        self.pipeline = rs.pipeline()
+        cfg = rs.config()
+        cfg.enable_device(self.args.cam_side_serial)
+        cfg.enable_stream(rs.stream.depth, W, H, rs.format.z16, fps)
+        cfg.enable_stream(rs.stream.color, W, H, rs.format.yuyv, fps)
+        self.frame_queue = rs.frame_queue(50)
+        self.pipeline.start(cfg, self.frame_queue)
+        profile = self.pipeline.get_active_profile()
+        self._depth_scale = float(profile.get_device().first_depth_sensor().get_depth_scale())
+        self._align = rs.align(rs.stream.color)
+        self.get_logger().info(f"Camera started, depth_scale={self._depth_scale}")
+
+    def _start_camera_thread(self) -> None:
+        t = threading.Thread(target=self._camera_loop, daemon=True, name="camera_rgbd_loop")
+        t.start()
+
+    def _camera_loop(self) -> None:
+        H, W = self.args.image_height, self.args.image_width
+        while rclpy.ok():
+            try:
+                frame = self.frame_queue.wait_for_frame(timeout_ms=2000)
+                fs = frame.as_frameset()
+                fs = self._align.process(fs)
+                color_frame = fs.get_color_frame()
+                depth_frame = fs.get_depth_frame()
+                if not color_frame or not depth_frame:
+                    continue
+
+                if self._cam_fx == 0.0:
+                    intr = color_frame.profile.as_video_stream_profile().intrinsics
+                    self._cam_fx = float(intr.fx)
+                    self._cam_fy = float(intr.fy)
+                    self._cam_cx = float(intr.ppx)
+                    self._cam_cy = float(intr.ppy)
+                    self.get_logger().info(
+                        f"Camera intrinsics fx={self._cam_fx:.3f} fy={self._cam_fy:.3f} "
+                        f"cx={self._cam_cx:.3f} cy={self._cam_cy:.3f}"
+                    )
+
+                yuyv = np.asanyarray(color_frame.get_data()).view(np.uint8).reshape(H, W, 2)
+                bgr = cv2.cvtColor(yuyv, cv2.COLOR_YUV2BGR_YUYV)
+                depth_u16 = np.asanyarray(depth_frame.get_data(), dtype=np.uint16).copy()
+                ok, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, int(self.args.jpeg_quality)])
+                if not ok:
+                    continue
+                payload = {
+                    "rgb_jpeg_b64": base64.b64encode(enc.tobytes()).decode("ascii"),
+                    "depth_zlib_b64": base64.b64encode(zlib.compress(depth_u16.tobytes())).decode("ascii"),
+                }
+                with self._policy_lock:
+                    self._rgbd_payload = payload
+            except Exception as e:
+                self.get_logger().warn(f"Camera loop error: {e}")
+                time.sleep(0.1)
+
+    def ee_cb(self, msg: JointState) -> None:
+        if len(msg.position) < 7:
+            return
+        with self._state_lock:
+            self.latest_ee = [float(x) for x in msg.position[:7]]
+            self.last_ee_time = time.time()
+
+    def queue_cb(self, msg: Bool) -> None:
+        with self._queue_lock:
+            self.queue_empty = bool(msg.data)
+            self.can_infer = self.allow_inference and self.queue_empty
+
+    def allow_cb(self, msg: Bool) -> None:
+        with self._queue_lock:
+            self.allow_inference = bool(msg.data)
+            self.can_infer = self.allow_inference and self.queue_empty
+
+    def _build_request(self) -> Optional[dict]:
+        with self._queue_lock:
+            if not self.can_infer:
+                return None
+        with self._state_lock:
+            ee = self.latest_ee
+            age = time.time() - self.last_ee_time if self.last_ee_time > 0 else 1e9
+        if ee is None or age > float(self.args.max_state_age):
+            return None
+        with self._policy_lock:
+            rgbd = self._rgbd_payload
+        if rgbd is None or self._cam_fx <= 0:
+            return None
+        req = {
+            "scene_id": int(self.args.scene_id),
+            "block_index": int(self.current_block_index),  # 服务器会覆盖，但这里保留可观测性
+            "ee_state": ee,
+            "image_width": int(self.args.image_width),
+            "image_height": int(self.args.image_height),
+            "fx": float(self._cam_fx),
+            "fy": float(self._cam_fy),
+            "cx": float(self._cam_cx),
+            "cy": float(self._cam_cy),
+            "depth_scale": float(self._depth_scale),
+            "T_base_cam": self._T_base_cam_row,
+            "rgb_jpeg_b64": rgbd["rgb_jpeg_b64"],
+            "depth_zlib_b64": rgbd["depth_zlib_b64"],
+        }
+        return req
+
+    async def _request_server(self, req: dict) -> dict:
+        async with websockets.connect(self.ws_uri) as ws:
+            await ws.send(json.dumps(req))
+            raw = await ws.recv()
+            return json.loads(raw)
+
+    def _publish_actions(self, actions: list) -> None:
+        with self._queue_lock:
+            self.can_infer = False
+        n = min(len(actions), int(self.args.max_actions_to_publish))
+        for i in range(n):
+            msg = Float32MultiArray()
+            msg.data = [float(x) for x in actions[i]]
+            self.action_pub.publish(msg)
+            if i < n - 1:
+                time.sleep(float(self.args.action_publish_interval))
+
+    def inference_cb(self) -> None:
+        req = self._build_request()
+        if req is None:
+            return
+        try:
+            t0 = time.time()
+            resp = asyncio.run(self._request_server(req))
+            dt = (time.time() - t0) * 1000.0
+            if resp.get("error"):
+                self.get_logger().error(f"Server error: {resp['error']}")
+                return
+            if resp.get("scene_done"):
+                self.get_logger().warn("scene_done=True")
+                return
+
+            self.current_block_index = int(resp.get("block_index", self.current_block_index))
+            self.current_phase = str(resp.get("phase", self.current_phase))
+            actions = resp.get("actions", [])
+            self._publish_actions(actions)
+            self.infer_count += 1
+            self.get_logger().info(
+                f"[{self.infer_count}] block={self.current_block_index} phase={self.current_phase} "
+                f"actions={len(actions)} pos_err={resp.get('pos_err_block_m', 'n/a')} infer_ms={dt:.1f}"
+            )
+        except Exception as e:
+            self.get_logger().error(f"Inference failed: {e}")
+
+    def destroy_node(self) -> bool:
+        try:
+            self.pipeline.stop()
+        except Exception:
+            pass
+        return super().destroy_node()
+
+
+def main(args: Args) -> None:
+    rclpy.init()
+    node = FrankaDywaInferenceNode(args)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Args))
+#!/usr/bin/env python3
 """
 Franka DyWA 推理节点（运行在真机侧机器）
 

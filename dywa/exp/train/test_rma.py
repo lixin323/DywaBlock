@@ -278,7 +278,9 @@ def main(cfg: Config):
     if cfg.load_environment is not None:
         env_ckpt = Path(cfg.load_environment)
     else:
-        env_ckpt = Path(cfg.load_student).parent / '../stat/env-last.ckpt'
+        _ls = Path(cfg.load_student)
+        _ls_base = _ls if _ls.is_dir() else _ls.parent
+        env_ckpt = _ls_base / '../stat/env-last.ckpt'
     if env_ckpt.is_file():
         env.load(env_ckpt, strict=True)
     else:

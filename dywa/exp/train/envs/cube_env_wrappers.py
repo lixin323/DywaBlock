@@ -1121,7 +1121,110 @@ class AddTrackingReward(WrapperEnv):
         self.__has_prv = th.zeros((env.num_env,),
                                   dtype=bool,
                                   device=env.device)
+        self.__identity_quat = th.as_tensor(
+            [[0.0, 0.0, 0.0, 1.0]],
+            dtype=th.float,
+            device=self.device
+        )
+        self.__symmetry_quats = self.__build_symmetry_quats()
         # self.__test_icp()
+
+    def __build_symmetry_quats(self) -> Dict[str, th.Tensor]:
+        # Cuboid: 180deg rotations around principal axes are equivalent.
+        cuboid_axa = th.as_tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [np.pi, 0.0, 0.0],
+                [0.0, np.pi, 0.0],
+                [0.0, 0.0, np.pi],
+            ],
+            dtype=th.float,
+            device=self.device
+        )
+        cuboid_quat = quat_from_axa(cuboid_axa)
+
+        arch_axa = th.as_tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, np.pi],
+            ],
+            dtype=th.float,
+            device=self.device
+        )
+        arch_quat = quat_from_axa(arch_axa)
+
+        triangle_axa = th.as_tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, np.pi],
+            ],
+            dtype=th.float,
+            device=self.device
+        )
+        triangle_quat = quat_from_axa(triangle_axa)
+
+        semi_cylinder_axa = th.as_tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, np.pi],
+            ],
+            dtype=th.float,
+            device=self.device
+        )
+        semi_cylinder_quat = quat_from_axa(semi_cylinder_axa)
+
+        # Cylinder: approximate continuous yaw symmetry by dense discretization.
+        n_yaw = 36
+        yaw = th.linspace(0.0, 2.0 * np.pi, steps=n_yaw + 1,
+                          dtype=th.float, device=self.device)[:-1]
+        cylinder_axa = th.zeros((n_yaw, 3), dtype=th.float, device=self.device)
+        cylinder_axa[:, 2] = yaw
+        cylinder_quat = quat_from_axa(cylinder_axa)
+
+        # Cube: 24 orientation-preserving symmetries.
+        mats = []
+        eye = np.eye(3, dtype=np.float32)
+        for perm in ((0, 1, 2), (0, 2, 1), (1, 0, 2),
+                     (1, 2, 0), (2, 0, 1), (2, 1, 0)):
+            p = eye[:, perm]
+            for sx in (-1.0, 1.0):
+                for sy in (-1.0, 1.0):
+                    for sz in (-1.0, 1.0):
+                        s = np.diag([sx, sy, sz]).astype(np.float32)
+                        r = p @ s
+                        if np.linalg.det(r) > 0.0:
+                            mats.append(r)
+        cube_mats = th.as_tensor(np.stack(mats, axis=0),
+                                 dtype=th.float,
+                                 device=self.device)
+        cube_quat = quaternion_from_matrix(cube_mats)
+
+        return {
+            'cube': cube_quat,
+            'cuboid': cuboid_quat,
+            'cylinder': cylinder_quat,
+            'arch': arch_quat,
+            'triangle': triangle_quat,
+            'semi_cylinder': semi_cylinder_quat
+        }
+
+    def __symmetry_quats_for_name(self, name: Optional[str]) -> th.Tensor:
+        if name is None:
+            return self.__identity_quat
+        lname = str(name).lower()
+        if lname.startswith('cube'):
+            return self.__symmetry_quats['cube']
+        if lname.startswith('cuboid'):
+            return self.__symmetry_quats['cuboid']
+        if lname.startswith('arch'):
+            return self.__symmetry_quats['arch']
+        if lname.startswith('triangle'):
+            return self.__symmetry_quats['triangle']
+        if lname.startswith('semi_cylinder'):
+            return self.__symmetry_quats['semi_cylinder']
+        if lname.startswith('cylinder'):
+            return self.__symmetry_quats['cylinder']
+        return self.__identity_quat
 
     def __test_icp(self):
         pcd0 = th.randn(size=(1, 512, 3))
@@ -1148,16 +1251,44 @@ class AddTrackingReward(WrapperEnv):
     def __pose_error(self,
                      pose0,
                      pose1,
-                     radius: th.Tensor):
+                     radius: th.Tensor,
+                     object_names: Optional[Iterable[str]] = None):
         # Nx3x3
         cardinal_points = radius[..., None, None] * th.eye(3,
                                                            dtype=th.float,
                                                            device=self.device)
-        error = (
-            apply_pose_tq(pose0[..., None, :], cardinal_points)
-            - apply_pose_tq(pose1[..., None, :], cardinal_points)
-        )
-        return th.linalg.norm(error, dim=-1).mean(dim=-1)
+        if object_names is None:
+            error = (
+                apply_pose_tq(pose0[..., None, :], cardinal_points)
+                - apply_pose_tq(pose1[..., None, :], cardinal_points)
+            )
+            return th.linalg.norm(error, dim=-1).mean(dim=-1)
+
+        names = list(object_names)
+        if len(names) != pose0.shape[0]:
+            error = (
+                apply_pose_tq(pose0[..., None, :], cardinal_points)
+                - apply_pose_tq(pose1[..., None, :], cardinal_points)
+            )
+            return th.linalg.norm(error, dim=-1).mean(dim=-1)
+
+        out = []
+        for i in range(pose0.shape[0]):
+            sym_quat = self.__symmetry_quats_for_name(names[i]).to(pose0.dtype)
+            k = sym_quat.shape[0]
+            pts = cardinal_points[i].unsqueeze(0).expand(k, -1, -1)
+
+            sym_pose = th.zeros((k, 7), dtype=pose0.dtype, device=self.device)
+            sym_pose[:, 3:7] = sym_quat
+
+            p0 = pose0[i].unsqueeze(0).expand(k, -1)
+            p1 = pose1[i].unsqueeze(0).expand(k, -1)
+
+            p0_sym = apply_pose_tq(p0, apply_pose_tq(sym_pose, pts))
+            p1_ref = apply_pose_tq(p1, pts)
+            err = th.linalg.norm(p0_sym - p1_ref, dim=-1).mean(dim=-1)
+            out.append(err.min())
+        return th.stack(out, dim=0)
 
     def step(self, *args, **kwds):
         obs, rew, done, info = super().step(*args, **kwds)
@@ -1179,7 +1310,8 @@ class AddTrackingReward(WrapperEnv):
 
             cur_error = self.__pose_error(pred_pose_delta,
                                           true_pose_delta,
-                                          cur_radius)
+                                          cur_radius,
+                                          self.scene.cur_names)
             if self.__prv_error is None:
                 self.__prv_error = cur_error
             dr = self.coef * self.__has_prv * (

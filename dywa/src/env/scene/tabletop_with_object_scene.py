@@ -590,16 +590,29 @@ class TableTopWithObjectScene(TableTopScene):
             for idx, scale in enumerate(self.scales):
                 key = self.keys[idx]
                 urdf = self.meta.urdf(key)
+                urdf_dir = Path(urdf).parent
                 with open(urdf, 'r', encoding='utf-8') as f:
                     str_urdf = f.read()
                 dom = minidom.parseString(str_urdf)
                 meshes = dom.getElementsByTagName("mesh")
                 for mesh in meshes:
+                    # Some generated URDFs may omit "scale".
+                    if 'scale' not in mesh.attributes:
+                        mesh.setAttribute('scale', '1 1 1')
                     mesh_scales = mesh.attributes['scale'].value.split(' ')
                     new_scale = [str(scale.item() * float(mesh_scale))
                                  for mesh_scale in mesh_scales]
                     mesh.attributes['scale'].value = \
                         ' '.join(new_scale)
+                    # Rebase relative mesh paths to absolute before writing
+                    # temporary URDF files under self.tmpdir.
+                    if 'filename' in mesh.attributes:
+                        mesh_file = mesh.attributes['filename'].value
+                        mesh_path = Path(mesh_file)
+                        if not mesh_path.is_absolute():
+                            mesh.attributes['filename'].value = str(
+                                (urdf_dir / mesh_path).resolve()
+                            )
                 with open(f'{self.tmpdir}/{key}.urdf', "w") as f:
                     dom.writexml(f)
             self.scales = th.as_tensor(self.scales,

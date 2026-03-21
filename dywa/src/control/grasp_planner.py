@@ -2,17 +2,85 @@
 
 from __future__ import annotations
 
-from typing import Literal, Tuple
+from pathlib import Path
+from typing import Literal, Optional, Tuple
 
 import numpy as np
 
 from .se3 import SE3, assert_se3
 
 
-ShapeType = Literal["cube", "semi_cylinder", "triangular_prism"]
-
 
 GRIPPER_MAX_WIDTH = 0.085  # Franka Panda 默认最大张开 85mm
+
+
+def _default_block_assets_dir() -> Path:
+    # dywa/src/control/grasp_planner.py -> repo_root/block_data/block_assets
+    return Path(__file__).resolve().parents[3] / "block_data" / "block_assets"
+
+
+def _infer_shape_family(object_id: str) -> str:
+    oid = object_id.lower()
+    if oid.startswith("semi_cylinder"):
+        return "semi_cylinder"
+    if oid.startswith("cylinder"):
+        return "cylinder"
+    if oid.startswith("tri_prism") or oid.startswith("triangular_prism") or oid.startswith("triangle"):
+        return "triangular_prism"
+    if oid.startswith("arch"):
+        return "arch"
+    if oid.startswith("cuboid"):
+        return "cuboid"
+    if oid.startswith("cube"):
+        return "cube"
+    return "unknown"
+
+
+def _read_obj_extent(object_id: str, block_assets_dir: Optional[Path]) -> Optional[np.ndarray]:
+    root = Path(block_assets_dir) if block_assets_dir is not None else _default_block_assets_dir()
+    path = root / f"{object_id}.obj"
+    if not path.is_file():
+        return None
+    mins = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
+    maxs = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
+    has_vertex = False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if not line.startswith("v "):
+                    continue
+                parts = line.strip().split()
+                if len(parts) < 4:
+                    continue
+                x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                v = np.array([x, y, z], dtype=np.float64)
+                mins = np.minimum(mins, v)
+                maxs = np.maximum(maxs, v)
+                has_vertex = True
+    except Exception:
+        return None
+    if not has_vertex:
+        return None
+    size = (maxs - mins).astype(np.float32)
+    if np.any(~np.isfinite(size)) or np.any(size <= 0):
+        return None
+    return size
+
+
+def _default_size_by_family(family: str) -> np.ndarray:
+    if family == "cube":
+        return np.array([0.05, 0.05, 0.05], dtype=np.float32)
+    if family == "cuboid":
+        return np.array([0.08, 0.04, 0.04], dtype=np.float32)
+    if family == "arch":
+        return np.array([0.10, 0.05, 0.05], dtype=np.float32)
+    if family == "semi_cylinder":
+        return np.array([0.06, 0.05, 0.025], dtype=np.float32)
+    if family == "cylinder":
+        return np.array([0.06, 0.05, 0.05], dtype=np.float32)
+    if family == "triangular_prism":
+        return np.array([0.06, 0.04, 0.04], dtype=np.float32)
+    return np.array([0.05, 0.05, 0.05], dtype=np.float32)
 
 
 def _make_se3(R: np.ndarray, t: np.ndarray) -> SE3:
@@ -149,6 +217,7 @@ def generate_grasp_pose(
     *,
     gripper_max_width: float = GRIPPER_MAX_WIDTH,
     table_normal_world: np.ndarray | None = None,
+    block_assets_dir: Path | None = None,
 ) -> Tuple[SE3, SE3, SE3, float]:
     """针对不同形状生成 ``(pre_grasp, grasp, lift_up, width)``.
 
@@ -176,23 +245,24 @@ def generate_grasp_pose(
     table_normal_world = np.asarray(table_normal_world, dtype=np.float32).reshape(3)
 
     oid = object_id.lower()
+    family = _infer_shape_family(oid)
+    size_obj = _read_obj_extent(oid, block_assets_dir)
+    if size_obj is None:
+        size_obj = _default_size_by_family(family)
 
     # --------------------------------------------------------------- #
     # 1) 近似 OBB 尺寸: 这里假设通过 ID 事先约定了尺寸 (米).
     #    若无精确 CAD, 可以在此处根据具体项目填入真实尺寸.
     # --------------------------------------------------------------- #
-    if oid.startswith("cube"):
-        # 示例: 5cm 立方体
-        size_obj = np.array([0.05, 0.05, 0.05], dtype=np.float32)
+    if family in ("cube", "cuboid", "arch"):
         T_world_grasp, grip_width = _grasp_from_side_faces_cube(
             current_se3, size_obj, table_normal_world, gripper_max_width
         )
-    elif oid.startswith("semi_cylinder"):
+    elif family in ("semi_cylinder", "cylinder"):
         # 半圆柱: 轴向长度 L, 半径 R
-        L = 0.06  # 6cm
-        R = 0.025  # 2.5cm
-        # 近似 OBB 尺寸 (以局部 x 为轴向, y 宽度, z 高度)
-        size_obj = np.array([L, 2.0 * R, R], dtype=np.float32)
+        # 优先从真实 mesh 尺寸估计
+        L = float(size_obj[0])
+        R = float(max(size_obj[1], size_obj[2]) * 0.5)
 
         # 优先用两端平整端面 (±x) 抓取
         T_world_obj = current_se3
@@ -266,17 +336,16 @@ def generate_grasp_pose(
 
             T_world_grasp = _make_se3(R_world_ee, p_world_ee)
             grip_width = min(size_obj[1] * 1.05, gripper_max_width)
-    elif oid.startswith("tri_prism") or oid.startswith("triangular_prism"):
+    elif family == "triangular_prism":
         # 三角柱: 假设局部 x 为柱体轴向, 底面为某一三角形面
         T_world_obj = current_se3
         R_world_obj = T_world_obj[:3, :3]
         p_world_obj = T_world_obj[:3, 3]
 
-        # 近似 OBB: 轴向长度 L, 高度 H, 宽度 W
-        L = 0.06
-        H = 0.04
-        W = 0.04
-        size_obj = np.array([L, W, H], dtype=np.float32)
+        # OBB 估计：轴向长度 L, 高度 H, 宽度 W
+        L = float(size_obj[0])
+        W = float(size_obj[1])
+        H = float(size_obj[2])
 
         axis_x_world = R_world_obj[:, 0]
         width_end = L
@@ -350,8 +419,7 @@ def generate_grasp_pose(
             T_world_grasp = _make_se3(R_world_ee, p_world_ee)
             grip_width = min(min(W, H) * 1.05, gripper_max_width)
     else:
-        # 若未识别形状, 退化为简单盒子侧面抓取, 假设 5cm 立方体
-        size_obj = np.array([0.05, 0.05, 0.05], dtype=np.float32)
+        # 未识别对象：按 mesh 尺寸（或默认尺寸）使用盒体侧面抓取
         T_world_grasp, grip_width = _grasp_from_side_faces_cube(
             current_se3, size_obj, table_normal_world, gripper_max_width
         )
