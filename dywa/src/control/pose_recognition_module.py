@@ -49,8 +49,21 @@ class LinemodPoseRecognitionModule:
 
         # Cube: C4 symmetry around local Z.
         if name.startswith("cube"):
-            for k in range(4):
-                out.append(_mk(self._rot_z(k * (np.pi / 2.0))))
+            mats = []
+            eye = np.eye(3, dtype=np.float32)
+            # Proper rotation group of cube (24 elements).
+            for perm in ((0, 1, 2), (0, 2, 1), (1, 0, 2),
+                         (1, 2, 0), (2, 0, 1), (2, 1, 0)):
+                p = eye[:, perm]
+                for sx in (-1.0, 1.0):
+                    for sy in (-1.0, 1.0):
+                        for sz in (-1.0, 1.0):
+                            s = np.diag([sx, sy, sz]).astype(np.float32)
+                            r = p @ s
+                            if np.linalg.det(r) > 0.0:
+                                mats.append(r)
+            for r in mats:
+                out.append(_mk(r))
             return out
 
         # Cuboid / arch: 180-degree rotational symmetry around local Z.
@@ -125,6 +138,7 @@ class LinemodPoseRecognitionModule:
         T_world_cam: SE3,
         target_T_world_block: Optional[SE3] = None,
         n_points: int = 1024,
+        match_threshold: float = 80.0,
     ) -> PoseRecognitionResult:
         out = detect_object_mask_pointcloud(
             rgb=rgb,
@@ -133,7 +147,7 @@ class LinemodPoseRecognitionModule:
             intrinsics=intrinsics,
             template_db=self.template_db,
             depth_scale=float(depth_scale),
-            match_threshold=80.0,
+            match_threshold=float(match_threshold),
             n_points=int(n_points),
             roi_radius_px=80,
             depth_band_m=0.03,

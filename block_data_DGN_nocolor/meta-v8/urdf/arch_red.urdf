@@ -1,0 +1,19 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="arch_red">  
+  <link name="base_link">  
+    <visual>  
+      <geometry>  
+        <mesh filename="arch_red.obj" scale="1 1 1" />  
+      </geometry>  
+    </visual>  
+    <collision>  
+      <geometry>  
+        <mesh filename="arch_red.obj" scale="1 1 1" />  
+      </geometry>  
+    </collision>  
+    <inertial>  
+      <mass value="0.1" />  
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01" />  
+    </inertial>  
+  </link>  
+</robot>

@@ -2,7 +2,7 @@ import os
 import numpy as np  
 import trimesh  
 from pkm.data.transforms.sample_points_from_urdf import sample_surface_points_from_urdf  
-  
+
 def convert_obj_to_corn(obj_path, object_name, output_dir="/input/DGN"):  
     """将OBJ文件转换为CORN格式"""  
       

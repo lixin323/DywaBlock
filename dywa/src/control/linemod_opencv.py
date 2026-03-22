@@ -30,6 +30,48 @@ class CameraIntrinsics:
         )
 
 
+def _read_detector_from_fs(detector, fs) -> bool:
+    """兼容读取不同 OpenCV 版本导出的 LINEMOD detector。"""
+    node = fs.getNode("linemod_detector")
+    if not node.empty():
+        detector.read(node)  # type: ignore[union-attr]
+        return True
+
+    for key in ("opencv_linemod_Detector", "linemod_Detector"):
+        node = fs.getNode(key)
+        if not node.empty():
+            detector.read(node)  # type: ignore[union-attr]
+            return True
+
+    try:
+        root = fs.root()
+        if root is not None and not root.empty():
+            detector.read(root)  # type: ignore[union-attr]
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _read_detector_from_file(detector, *, class_id: str, path: Path) -> bool:
+    """优先使用 readClasses(file) 读取；失败再回退到 FileStorage 节点读取。"""
+    try:
+        if hasattr(detector, "readClasses"):
+            detector.readClasses([str(class_id)], str(path))
+            return True
+    except Exception:
+        pass
+
+    import cv2  # type: ignore
+
+    fs = cv2.FileStorage(str(path), cv2.FILE_STORAGE_READ)
+    if not fs.isOpened():
+        return False
+    ok = _read_detector_from_fs(detector, fs)
+    fs.release()
+    return ok
+
+
 class OpenCvLinemodDetector:
     """OpenCV LINEMOD 的一个可运行封装（需要 opencv-contrib）.
 
@@ -96,18 +138,14 @@ class OpenCvLinemodDetector:
         # 文件内部结构由用户生成；这里仅做 Detector.read 的尝试。
         loaded_any = False
         for p in sorted(db.glob("*.y*ml")):
-            fs = cv2.FileStorage(str(p), cv2.FILE_STORAGE_READ)
-            node = fs.getNode("linemod_detector")
-            if node.empty():
-                fs.release()
+            class_id = p.stem
+            if not _read_detector_from_file(self._detector, class_id=class_id, path=p):
                 continue
-            self._detector.read(node)  # type: ignore[union-attr]
-            fs.release()
             loaded_any = True
 
         if not loaded_any:
             raise RuntimeError(
-                f"模板库 {db} 中未发现可读取的 'linemod_detector' 节点。"
+                f"模板库 {db} 中未发现可读取的 LINEMOD detector。"
             )
         self._loaded = True
 
@@ -262,14 +300,11 @@ def detect_object_pose(
 
     # 1) 加载该积木的 LINEMOD 检测器与位姿表
     detector = _get_linemod_detector()
+    if not _read_detector_from_file(detector, class_id=object_name, path=yml_path):
+        return None
     fs = cv2.FileStorage(str(yml_path), cv2.FILE_STORAGE_READ)
     if not fs.isOpened():
         return None
-    node = fs.getNode("linemod_detector")
-    if node.empty():
-        fs.release()
-        return None
-    detector.read(node)  # type: ignore[union-attr]
     nt_node = fs.getNode("num_templates")
     if nt_node.empty():
         fs.release()
@@ -293,7 +328,7 @@ def detect_object_pose(
         return None
 
     # 2) LINEMOD 匹配：获取最佳模板与像素位置（OpenCV 惯例：u=x, v=y）
-    depth_uint16 = _depth_m_to_uint16_mm(depth_m)
+    depth_uint16 = _to_linemod_depth_uint16(depth, depth_scale)
     sources_rgbd = [rgb, depth_uint16]
     sources_rgb = [rgb]
     matches = None
@@ -434,17 +469,14 @@ def detect_object_mask_pointcloud(
 
     # 重新匹配一次以获取匹配点像素 (u,v)
     detector = _get_linemod_detector()
+    if not _read_detector_from_file(detector, class_id=object_name, path=yml_path):
+        return None
     fs = cv2.FileStorage(str(yml_path), cv2.FILE_STORAGE_READ)
     if not fs.isOpened():
         return None
-    node = fs.getNode("linemod_detector")
-    if node.empty():
-        fs.release()
-        return None
-    detector.read(node)  # type: ignore[union-attr]
     fs.release()
 
-    depth_uint16 = _depth_m_to_uint16_mm(depth_m)
+    depth_uint16 = _to_linemod_depth_uint16(depth, depth_scale)
     sources_rgbd = [rgb, depth_uint16]
     sources_rgb = [rgb]
     matches = None
@@ -533,6 +565,26 @@ def _depth_m_to_uint16_mm(depth_m: np.ndarray) -> np.ndarray:
     """将深度从米转为 uint16 毫米，无效处为 0。"""
     depth_mm = np.clip(depth_m * 1000.0, 0, 65535)
     return np.where(depth_m > 0, depth_mm.astype(np.uint16), np.uint16(0))
+
+
+def _to_linemod_depth_uint16(depth: np.ndarray, depth_scale: float) -> np.ndarray:
+    """强制转换为 LINEMOD 需要的 uint16(mm) 深度图。"""
+    d = np.asarray(depth)
+    if d.size == 0:
+        return np.zeros((0, 0), dtype=np.uint16)
+
+    if d.dtype == np.uint16:
+        out = d.copy()
+        return np.ascontiguousarray(out)
+
+    d = d.astype(np.float32, copy=False)
+    d[~np.isfinite(d)] = 0.0
+    # 输入可能是米(float)或毫米(float)；这里统一转换到米再转毫米
+    if float(np.max(d)) <= 10.0:
+        depth_m = d
+    else:
+        depth_m = d * float(depth_scale)
+    return np.ascontiguousarray(_depth_m_to_uint16_mm(depth_m))
 
 
 def _fallback_depth_neighborhood(depth_m: np.ndarray, u: int, v: int, radius: int = 10) -> float:

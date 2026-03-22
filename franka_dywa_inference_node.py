@@ -265,8 +265,9 @@ def main(args: Args) -> None:
         rclpy.shutdown()
 
 
-if __name__ == "__main__":
-    main(tyro.cli(Args))
+## NOTE:
+## 此文件历史上被拼接了两份实现，这里禁用前半段入口，
+## 统一使用文件末尾的唯一入口（完整版本）。
 #!/usr/bin/env python3
 """
 Franka DyWA 推理节点（运行在真机侧机器）
@@ -295,8 +296,6 @@ import time
 import logging
 import threading
 import copy
-import subprocess
-import sys
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
@@ -309,6 +308,11 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray, Bool
 import tyro
+
+try:
+    from websockets.sync.client import connect as ws_connect_sync
+except Exception:
+    ws_connect_sync = None
 
 @dataclasses.dataclass
 class Args:
@@ -388,6 +392,8 @@ class FrankaInferenceNode(Node):
         # 连接 DyWA Policy Server 的基本信息
         self.ws_uri = f"ws://{args.policy_server_host}:{args.policy_server_port}"
         self.get_logger().info(f"DyWA Policy Server: {self.ws_uri}")
+        self._ws = None
+        self._ws_lock = threading.Lock()
 
         csv = (args.t_base_cam_csv or "").strip()
         if not csv:
@@ -474,12 +480,6 @@ class FrankaInferenceNode(Node):
         self._session_dir = Path(__file__).resolve().parent / "logs" / f"session_{self._session_start}"
         (self._session_dir / "images").mkdir(parents=True, exist_ok=True)
         self._init_video_writers()
-        self._session_data = {
-            "scene_id": args.scene_id,
-            "block_index": args.block_index,
-            "session": self._session_start,
-            "chunks": [],
-        }
 
         self.get_logger().info("=" * 60)
         self.get_logger().info(f"[推理节点] 已启动 | scene_id={args.scene_id} block_index={args.block_index}")
@@ -598,7 +598,6 @@ class FrankaInferenceNode(Node):
             writer = self.video_writers.get(cam_name)
             try:
                 frame = fq.wait_for_frame(timeout_ms=2000)
-                consecutive_failures = 0
                 try:
                     fs = frame.as_frameset()
                 except Exception:
@@ -624,14 +623,17 @@ class FrankaInferenceNode(Node):
                 img_bgr = cv2.cvtColor(img_yuyv, cv2.COLOR_YUV2BGR_YUYV)
                 depth_u16 = np.asanyarray(df.get_data(), dtype=np.uint16).copy()
                 ok, enc = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
-                if ok:
-                    with self._policy_snap_lock:
-                        self._policy_snap = {
-                            "rgb_jpeg_b64": base64.b64encode(enc.tobytes()).decode("ascii"),
-                            "depth_zlib_b64": base64.b64encode(
-                                zlib.compress(depth_u16.tobytes())
-                            ).decode("ascii"),
-                        }
+                if not ok:
+                    raise RuntimeError("JPEG 编码失败")
+                with self._policy_snap_lock:
+                    self._policy_snap = {
+                        "rgb_jpeg_b64": base64.b64encode(enc.tobytes()).decode("ascii"),
+                        "depth_zlib_b64": base64.b64encode(
+                            zlib.compress(depth_u16.tobytes())
+                        ).decode("ascii"),
+                    }
+                # 仅在有效 RGB-D 成功编码并写入快照后，才重置失败计数
+                consecutive_failures = 0
                 img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                 with self.state_lock:
                     self.latest_images[cam_name] = img_rgb
@@ -668,27 +670,38 @@ class FrankaInferenceNode(Node):
         """（可选）根据需要保存侧边相机图像，目前 DyWA server 不需要图像，可留空实现。"""
         return
 
-    def _generate_html_report(self):
-        """保存 actions.json 并调用 generate_report.py 生成 HTML 可视化报告"""
+    def _ensure_ws_connected(self):
+        if self._ws is not None:
+            return
+        if ws_connect_sync is None:
+            raise RuntimeError("websockets.sync.client 不可用，无法建立长连接")
+        self._ws = ws_connect_sync(self.ws_uri, open_timeout=3.0, close_timeout=1.0)
+        self.get_logger().info(f"[WS] 已连接 {self.ws_uri}")
+
+    def _close_ws(self):
+        if self._ws is None:
+            return
         try:
-            json_path = self._session_dir / "actions.json"
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(self._session_data, f, ensure_ascii=False)
-            self.get_logger().info(f"[报告] 数据已保存: {json_path}")
-            script = Path(__file__).resolve().parent / "generate_report.py"
-            result = subprocess.run(
-                [sys.executable, str(script), str(self._session_dir)],
-                timeout=60, capture_output=True, text=True, check=False,
-            )
-            if result.returncode == 0:
-                self.get_logger().info(f"[报告] {result.stdout.strip()}")
-            else:
-                self.get_logger().warn(f"[报告] 生成失败: {result.stderr.strip()}")
-        except Exception as e:
-            self.get_logger().warn(f"[报告] 生成异常: {e}")
+            self._ws.close()
+        except Exception:
+            pass
+        finally:
+            self._ws = None
+
+    def _request_server_sync(self, req: dict) -> dict:
+        with self._ws_lock:
+            try:
+                self._ensure_ws_connected()
+                self._ws.send(json.dumps(req))
+                resp_raw = self._ws.recv()
+                return json.loads(resp_raw)
+            except Exception:
+                self._close_ws()
+                raise
 
     def destroy_node(self):
-        """清理：释放视频文件，生成 HTML 报告，停止所有相机 pipeline"""
+        """清理：释放视频文件，停止所有相机 pipeline"""
+        self._close_ws()
         # 先释放 VideoWriter，确保视频文件写完整
         for cam_name, writer in self.video_writers.items():
             try:
@@ -696,7 +709,6 @@ class FrankaInferenceNode(Node):
                 self.get_logger().info(f"[视频] {cam_name} 已保存")
             except Exception:
                 pass
-        self._generate_html_report()
         for cam_name, pipeline in self.camera_pipelines.items():
             try:
                 pipeline.stop()
@@ -884,13 +896,7 @@ class FrankaInferenceNode(Node):
         try:
             start_time = time.time()
 
-            async def _request():
-                async with websockets.connect(self.ws_uri) as ws:
-                    await ws.send(json.dumps(req))
-                    resp_raw = await ws.recv()
-                    return json.loads(resp_raw)
-
-            resp = asyncio.run(_request())
+            resp = self._request_server_sync(req)
             inference_time = time.time() - start_time
             self.last_inference_time = inference_time
 
@@ -907,7 +913,6 @@ class FrankaInferenceNode(Node):
                     if new_bi != int(self.args.block_index):
                         self.get_logger().info(f"[任务] 切换 block_index: {self.args.block_index} -> {new_bi}")
                         self.args.block_index = new_bi
-                        self._session_data["block_index"] = new_bi
                 except Exception:
                     pass
 
@@ -921,17 +926,7 @@ class FrankaInferenceNode(Node):
 
             actions_to_publish = actions[: self.args.max_actions_to_publish]
 
-            # 记录到 session 数据（用于生成 HTML 报告）
             self.all_chunks.append(actions_to_publish)
-            self._session_data["chunks"].append(
-                {
-                    "chunk_id": self.inference_count,
-                    "actions": [list(a) for a in actions_to_publish],
-                    "ee_state_sent": ee_raw,
-                    "inference_time_ms": round(inference_time * 1000, 1),
-                    "pos_err_block_m": resp.get("pos_err_block_m"),
-                }
-            )
 
             # 发布动作后，重置推理标志，等待下次队列清空信号
             with self.queue_status_lock:

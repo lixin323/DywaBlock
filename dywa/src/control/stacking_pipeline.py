@@ -41,6 +41,11 @@ class PipelineConfig:
     adjust_region_z_m: float = 0.05
     place_tol_m: float = 0.02
     grasp_steps_per_segment: int = 6
+    # server 侧动作安全限幅（单步变化）
+    max_action_step_pos_m: float = 0.03
+    max_action_step_rot_rad: float = 0.35
+    max_action_step_gripper: float = 0.6
+    linemod_match_threshold: float = 60.0
 
 
 @dataclass
@@ -137,6 +142,54 @@ class BlockStackingPipeline:
         actions.append(last)
         return actions
 
+    @staticmethod
+    def _clamp_norm(delta: np.ndarray, max_norm: float) -> np.ndarray:
+        n = float(np.linalg.norm(delta))
+        if n <= max_norm or n < 1e-12:
+            return delta
+        return delta * (max_norm / n)
+
+    def _apply_action_safety(self, actions: List[List[float]], ee_state: List[float]) -> tuple[List[List[float]], Dict[str, int]]:
+        """对 server 输出动作做安全限幅，避免相邻动作变化过大。"""
+        if not actions:
+            return [], {"clamped_steps": 0}
+
+        max_dp = float(self.cfg.max_action_step_pos_m)
+        max_dr = float(self.cfg.max_action_step_rot_rad)
+        max_dg = float(self.cfg.max_action_step_gripper)
+
+        prev = np.asarray(ee_state[:7], dtype=np.float32).copy()
+        safe_actions: List[List[float]] = []
+        clamped_steps = 0
+
+        for a in actions:
+            cur = np.asarray(a[:7], dtype=np.float32).copy()
+            raw = cur.copy()
+
+            # 位置单步限幅（按向量范数）
+            dpos = cur[:3] - prev[:3]
+            cur[:3] = prev[:3] + self._clamp_norm(dpos, max_dp)
+
+            # 姿态单步限幅（rpy 增量按向量范数）
+            drpy = cur[3:6] - prev[3:6]
+            cur[3:6] = prev[3:6] + self._clamp_norm(drpy, max_dr)
+
+            # 夹爪变化限幅 + 范围约束
+            dg = float(cur[6] - prev[6])
+            if dg > max_dg:
+                cur[6] = prev[6] + max_dg
+            elif dg < -max_dg:
+                cur[6] = prev[6] - max_dg
+            cur[6] = float(np.clip(cur[6], 0.0, 1.0))
+
+            if not np.allclose(raw, cur, atol=1e-8):
+                clamped_steps += 1
+
+            safe_actions.append([float(x) for x in cur.tolist()])
+            prev = cur
+
+        return safe_actions, {"clamped_steps": clamped_steps}
+
     def _target_with_offset_m(self, T_gt: SE3, *, use_dywa_offset: bool) -> SE3:
         T = np.asarray(T_gt, dtype=np.float32).copy()
         assert_se3(T)
@@ -204,6 +257,7 @@ class BlockStackingPipeline:
             T_world_cam=T_world_cam,
             target_T_world_block=target_T_world_block_dywa,
             n_points=1024,
+            match_threshold=float(self.cfg.linemod_match_threshold),
         )
         pos_err = self._translation_err(obs.T_world_block, target_T_world_block_dywa)
         rot_err_deg = self._rotation_err_deg(obs.T_world_block, target_T_world_block_dywa)
@@ -237,6 +291,7 @@ class BlockStackingPipeline:
                     lift_up=grasp.lift_up,
                 )
                 state.phase = "GRASPED"
+            actions, safety = self._apply_action_safety(actions, ee_state)
             return {
                 "error": "",
                 "actions": actions,
@@ -249,6 +304,7 @@ class BlockStackingPipeline:
                 "target_pos_dywa_m": np.asarray(target_T_world_block_dywa[:3, 3], dtype=np.float32).tolist(),
                 "target_pos_grasp_m": np.asarray(target_T_world_block_grasp[:3, 3], dtype=np.float32).tolist(),
                 "object_name": target.object_name,
+                "safety": safety,
             }
 
         # 3) GRASPED 阶段：抓取后平移到 GT 目标位置，再切下一块
@@ -270,6 +326,7 @@ class BlockStackingPipeline:
             state.phase = "ADJUST"
             state.place_delta_xyz = None
             self._adjust.reset_episode()
+            actions, safety = self._apply_action_safety(actions, ee_state)
             return {
                 "error": "",
                 "actions": actions,
@@ -282,6 +339,7 @@ class BlockStackingPipeline:
                 "target_pos_dywa_m": np.asarray(target_T_world_block_dywa[:3, 3], dtype=np.float32).tolist(),
                 "target_pos_grasp_m": np.asarray(target_T_world_block_grasp[:3, 3], dtype=np.float32).tolist(),
                 "object_name": target.object_name,
+                "safety": safety,
             }
 
         return {"error": f"unknown phase={state.phase}", "actions": [], "scene_done": False}

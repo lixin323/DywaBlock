@@ -10,6 +10,7 @@ from typing import Any, Dict
 import tyro
 import websockets
 from websockets.server import WebSocketServerProtocol
+from websockets.exceptions import ConnectionClosed
 
 from .stacking_pipeline import BlockStackingPipeline, PipelineConfig
 
@@ -36,6 +37,10 @@ class ServerConfig:
     adjust_region_z_m: float = 0.05
     place_tol_m: float = 0.02
     grasp_steps_per_segment: int = 6
+    max_action_step_pos_m: float = 0.03
+    max_action_step_rot_rad: float = 0.35
+    max_action_step_gripper: float = 0.6
+    linemod_match_threshold: float = 60.0
 
 
 class DywaPolicyServer:
@@ -63,24 +68,36 @@ class DywaPolicyServer:
                 adjust_region_z_m=cfg.adjust_region_z_m,
                 place_tol_m=cfg.place_tol_m,
                 grasp_steps_per_segment=cfg.grasp_steps_per_segment,
+                max_action_step_pos_m=cfg.max_action_step_pos_m,
+                max_action_step_rot_rad=cfg.max_action_step_rot_rad,
+                max_action_step_gripper=cfg.max_action_step_gripper,
+                linemod_match_threshold=cfg.linemod_match_threshold,
             )
         )
         self._lock = asyncio.Lock()
 
     async def handle_connection(self, ws: WebSocketServerProtocol) -> None:
-        async for message in ws:
-            try:
-                req: Dict[str, Any] = json.loads(message)
-            except Exception:
-                await ws.send(json.dumps({"error": "invalid json", "actions": [], "scene_done": False}))
-                continue
-
-            async with self._lock:
+        peer = getattr(ws, "remote_address", None)
+        print(f"[DywaPolicyServer] client connected: {peer}")
+        try:
+            async for message in ws:
                 try:
-                    resp = self.pipeline.process_request(req)
-                except Exception as e:
-                    resp = {"error": str(e), "actions": [], "scene_done": False}
-            await ws.send(json.dumps(resp))
+                    req: Dict[str, Any] = json.loads(message)
+                except Exception:
+                    await ws.send(json.dumps({"error": "invalid json", "actions": [], "scene_done": False}))
+                    continue
+
+                async with self._lock:
+                    try:
+                        resp = self.pipeline.process_request(req)
+                    except Exception as e:
+                        resp = {"error": str(e), "actions": [], "scene_done": False}
+                await ws.send(json.dumps(resp))
+        except ConnectionClosed:
+            # 客户端非正常断开时直接结束 handler，避免打印 traceback 干扰主日志
+            return
+        finally:
+            print(f"[DywaPolicyServer] client disconnected: {peer}")
 
     async def run(self) -> None:
         async with websockets.serve(self.handle_connection, self.cfg.host, self.cfg.port):

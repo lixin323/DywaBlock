@@ -13,23 +13,33 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 # 项目根目录
 SCRIPT_DIR = Path(__file__).resolve().parent
 BLOCK_ASSETS_DIR = SCRIPT_DIR / "block_assets"
-LINEMOD_OUTPUT_DIR = SCRIPT_DIR / "linemod_templates"
+LINEMOD_OUTPUT_DIR = SCRIPT_DIR / "linemod_templates-real"
 
-# 默认相机内参（可对标定结果修改）
-DEFAULT_FX = 500.0
-DEFAULT_FY = 500.0
-DEFAULT_CX = 320.0
-DEFAULT_CY = 240.0
+# 默认相机内参（来自标定 camera matrix）
+
+DEFAULT_FX = 611.023473
+DEFAULT_FY = 612.591246
+DEFAULT_CX = 330.929700
+DEFAULT_CY = 247.915796
 DEFAULT_WIDTH = 640
 DEFAULT_HEIGHT = 480
 
+#仿真内参
+'''
+DEFAULT_FX = 160.0      # fx = width / (2 * tan(FOV/2))  
+DEFAULT_FY = 160.0      # fy = fx (方形像素)  
+DEFAULT_CX = 64.0       # cx = width/2  
+DEFAULT_CY = 64.0       # cy = height/2  
+DEFAULT_WIDTH = 128  
+DEFAULT_HEIGHT = 128
+'''
 # 球形采样半径（米），物体中心在原点
 SPHERE_RADIUS = 0.4
 # 视角数量
@@ -78,9 +88,39 @@ def get_linemod_detector():
     raise RuntimeError("当前 OpenCV 未包含 linemod（请安装 opencv-contrib-python）。")
 
 
+def _load_mtl_base_color(obj_path: Path) -> Optional[np.ndarray]:
+    """
+    从 MTL 文件读取首个 Kd 颜色。
+    优先级:
+      1) OBJ 同目录 `<name>.mtl`
+      2) `<obj_dir>/MTLs/<name>.mtl`
+    """
+    candidates = [
+        obj_path.with_suffix(".mtl"),
+        obj_path.parent / "MTLs" / f"{obj_path.stem}.mtl",
+    ]
+    for mtl in candidates:
+        if not mtl.is_file():
+            continue
+        try:
+            with open(mtl, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    s = line.strip()
+                    if s.startswith("Kd "):
+                        vals = s.split()[1:4]
+                        if len(vals) == 3:
+                            rgb = np.asarray([float(vals[0]), float(vals[1]), float(vals[2])], dtype=np.float32)
+                            rgb = np.clip(rgb, 0.0, 1.0)
+                            return np.asarray([rgb[0], rgb[1], rgb[2], 1.0], dtype=np.float32)
+        except Exception:
+            continue
+    return None
+
+
 def load_mesh_centered(obj_path: Path):
-    """使用 Open3D 或 trimesh 加载 OBJ，平移使几何中心在原点，返回 o3d.geometry.TriangleMesh。"""
+    """使用 Open3D 或 trimesh 加载 OBJ，平移使几何中心在原点，返回 (mesh, rgba_base_color)。"""
     import open3d as o3d
+    base_color = _load_mtl_base_color(obj_path)
 
     mesh = o3d.io.read_triangle_mesh(str(obj_path))
     if not mesh.has_vertices():
@@ -104,7 +144,7 @@ def load_mesh_centered(obj_path: Path):
     center = verts.mean(axis=0)
     mesh.vertices = o3d.utility.Vector3dVector(verts - center)
     mesh.compute_vertex_normals()
-    return mesh
+    return mesh, base_color
 
 
 def _create_offscreen_renderer(width: int, height: int):
@@ -141,6 +181,7 @@ def _set_renderer_background(renderer, r: float, g: float, b: float, a: float = 
 
 def render_rgb_depth(
     mesh,
+    base_color: Optional[np.ndarray],
     eye: np.ndarray,
     width: int,
     height: int,
@@ -165,7 +206,15 @@ def render_rgb_depth(
         mat = o3d.visualization.rendering.Material()
     mat.shader = "defaultLit"
     if hasattr(mat, "base_color"):
-        mat.base_color = [0.7, 0.7, 0.7, 1.0]
+        if base_color is None:
+            mat.base_color = [0.7, 0.7, 0.7, 1.0]
+        else:
+            mat.base_color = [
+                float(base_color[0]),
+                float(base_color[1]),
+                float(base_color[2]),
+                float(base_color[3]),
+            ]
     renderer.scene.add_geometry("mesh", mesh, mat)
     _set_renderer_background(renderer, 1.0, 1.0, 1.0, 1.0)
 
@@ -237,7 +286,7 @@ def process_one_obj(
     import cv2
 
     block_name = obj_path.stem
-    mesh = load_mesh_centered(obj_path)
+    mesh, base_color = load_mesh_centered(obj_path)
     object_id = block_name
 
     detector = get_linemod_detector()
@@ -260,7 +309,7 @@ def process_one_obj(
         R_obj_to_cam = R_cam
 
         rgb, depth_m = render_rgb_depth(
-            mesh, eye, width, height, fx, fy, cx, cy
+            mesh, base_color, eye, width, height, fx, fy, cx, cy
         )
         depth_uint16 = depth_meters_to_uint16_mm(depth_m)
         # 物体掩码：深度有效处为物体（255），背景为 0；LINEMOD 部分版本强制要求 object_mask
@@ -297,32 +346,43 @@ def process_one_obj(
     output_dir.mkdir(parents=True, exist_ok=True)
     out_yml = output_dir / f"{block_name}.yml"
 
-    fs = cv2.FileStorage(str(out_yml), cv2.FILE_STORAGE_WRITE)
-    if fs.isOpened():
-        # 保存检测器到 "linemod_detector" 节点（与 dywa linemod_opencv 的 read 一致）
+    detector_saved = False
+    if hasattr(detector, "writeClasses"):
         try:
-            if hasattr(fs, "startWriteStruct"):
-                fs.startWriteStruct("linemod_detector", cv2.FILE_NODE_MAP)
-                detector.write(fs)
-                fs.endWriteStruct()
-            else:
-                detector.write(fs)
+            detector.writeClasses(str(out_yml))
+            detector_saved = True
         except Exception:
+            pass
+    elif hasattr(detector, "write"):
+        fs = cv2.FileStorage(str(out_yml), cv2.FILE_STORAGE_WRITE)
+        if fs.isOpened():
             try:
-                fs.write("linemod_detector", detector)
+                detector.write(fs)
+                detector_saved = True
             except Exception:
                 pass
-        # 保存位姿映射：template_id -> R(3x3), t(3,) 供 6D 位姿恢复
-        fs.write("object_id", object_id)
-        fs.write("num_templates", len(poses_R))
-        for i in range(len(poses_R)):
-            fs.write(f"R_{i}", poses_R[i])
-            fs.write(f"t_{i}", poses_t[i])
-        fs.release()
-        print(f"  已保存: {out_yml} (模板数 {len(poses_R)})")
-        return True
-    print(f"  [错误] 无法写入 {out_yml}", file=sys.stderr)
-    return False
+            fs.release()
+
+    if not detector_saved:
+        print(
+            "  [错误] 当前 OpenCV 的 linemod.Detector 不支持 writeClasses/write，无法持久化模板。",
+            file=sys.stderr,
+        )
+        return False
+
+    fs = cv2.FileStorage(str(out_yml), cv2.FILE_STORAGE_APPEND)
+    if not fs.isOpened():
+        print(f"  [错误] detector 已保存，但无法追加位姿到 {out_yml}", file=sys.stderr)
+        return False
+    # 保存位姿映射：template_id -> R(3x3), t(3,) 供 6D 位姿恢复
+    fs.write("object_id", object_id)
+    fs.write("num_templates", len(poses_R))
+    for i in range(len(poses_R)):
+        fs.write(f"R_{i}", poses_R[i])
+        fs.write(f"t_{i}", poses_t[i])
+    fs.release()
+    print(f"  已保存: {out_yml} (模板数 {len(poses_R)})")
+    return True
 
 
 def find_obj_files(root: Path, exclude_dirs: Tuple[str, ...] = ("dywa_processed",)) -> List[Path]:

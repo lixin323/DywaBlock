@@ -19,7 +19,8 @@ from env.env.wrap.record_viewer import RecordViewer
 # from env.env.wrap.nvdr_record_viewer import NvdrRecordViewer
 # from env.env.wrap.nvdr_record_episode import NvdrRecordEpisode
 from envs.cube_env_wrappers import (CountCategoricalSuccess,
-                                    ScenarioTest
+                                    ScenarioTest,
+                                    CountLinemodPoseLoss
                                     )
 
 from env.env.wrap.reset_ig_camera import reset_ig_camera
@@ -97,6 +98,11 @@ class Config(RMAConfig):
 
     train_rma: bool = False
     log_categorical_results: bool = False
+    log_linemod_loss: bool = False
+    linemod_template_db: str = "/home/user/DyWA/block_data/linemod_templates"
+    linemod_block_assets_dir: str = "/home/user/DyWA/block_data/block_assets"
+    linemod_match_threshold: float = 60.0
+    linemod_use_icp: bool = False
     use_log_episode: bool = False
     draw_debug_lines: bool = False
     log_episode: LogEpisodes.Config = LogEpisodes.Config()
@@ -209,14 +215,26 @@ def main(cfg: Config):
 
     if cfg.log_categorical_results:
         env = CountCategoricalSuccess(env)
+    if cfg.log_linemod_loss:
+        env = CountLinemodPoseLoss(
+            env,
+            template_db=cfg.linemod_template_db,
+            block_assets_dir=cfg.linemod_block_assets_dir,
+            match_threshold=cfg.linemod_match_threshold,
+            use_icp=cfg.linemod_use_icp
+        )
 
     if cfg.test_scenario:
         env = ScenarioTest(env)
 
     # Update cfg elements from `env`.
     if not cfg.train_student_policy:
+        state_blocklist = list(cfg.state_net_blocklist)
+        if cfg.log_linemod_loss and ('color' not in state_blocklist):
+            # `color` is only used by LINEMOD evaluator, not policy input.
+            state_blocklist.append('color')
         cfg = replace(cfg, net=update_net_cfg(cfg.net, env,
-                                              cfg.state_net_blocklist))
+                                              state_blocklist))
         # load teacher
         teacher_agent = load_agent(cfg, env, None, None)
         teacher_agent.eval()
@@ -282,7 +300,10 @@ def main(cfg: Config):
         _ls_base = _ls if _ls.is_dir() else _ls.parent
         env_ckpt = _ls_base / '../stat/env-last.ckpt'
     if env_ckpt.is_file():
-        env.load(env_ckpt, strict=True)
+        # LINEMOD online eval may add camera color observation keys that are
+        # absent in legacy normalizer stats checkpoints.
+        env_load_strict = (not cfg.log_linemod_loss)
+        env.load(env_ckpt, strict=env_load_strict)
     else:
         raise ValueError
         env_ckpt = cfg.load_student + '_stat'
@@ -392,6 +413,8 @@ def main(cfg: Config):
         finally:
             if cfg.log_categorical_results:
                 env.unwrap(target=CountCategoricalSuccess).save()
+            if cfg.log_linemod_loss:
+                env.unwrap(target=CountLinemodPoseLoss).save()
 
 
 if __name__ == '__main__':

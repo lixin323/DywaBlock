@@ -28,6 +28,7 @@ from env.env.wrap.base import (
 )
 from env.env.wrap.monitor_env import MonitorEnv
 from env.env.wrap.normalize_env import NormalizeEnv
+from env.env.wrap.nvdr_camera_wrapper import NvdrCameraWrapper
 
 from env.robot.fe_gripper import FEGripper
 from util.path import ensure_directory
@@ -64,6 +65,7 @@ from icecream import ic
 from omegaconf import OmegaConf
 import sys
 import logging
+import json
 
 try:
     # sys.path.append("/tmp/point2vec/")
@@ -1715,6 +1717,251 @@ class CountCategoricalSuccess(WrapperEnv):
                         'categorical_result.png'), dpi=400)
         with open(str(self._save_dir / 'categorical_result.pkl'), "wb") as fp:
             pickle.dump(sorted_results, fp)
+
+
+class CountLinemodPoseLoss(WrapperEnv):
+    def __init__(self,
+                 env: EnvIface,
+                 template_db: str,
+                 block_assets_dir: str,
+                 match_threshold: float = 80.0,
+                 use_icp: bool = False):
+        super().__init__(env)
+        self._save_dir: Path = ensure_directory(
+            '/home/user/DyWA/output/test_rma/dywa/result/linemod')
+        self._match_threshold = float(match_threshold)
+        self._use_icp = bool(use_icp)
+        self._template_db = str(template_db)
+        self._block_assets_dir = str(block_assets_dir)
+        self._records = []
+        self._num_total = 0
+        self._num_detected = 0
+        self._fail_reasons = {}
+
+        # Lazy import to avoid forcing OpenCV dependency when disabled.
+        from control.linemod_opencv import detect_object_pose, CameraIntrinsics
+        self._detect_object_pose = detect_object_pose
+        self._CameraIntrinsics = CameraIntrinsics
+
+        self._nvdr = env.unwrap(target=NvdrCameraWrapper)
+        if self._nvdr is None:
+            raise RuntimeError("CountLinemodPoseLoss 需要 NvdrCameraWrapper")
+        if not self._nvdr.cfg.use_depth:
+            raise RuntimeError("CountLinemodPoseLoss 需要 camera.use_depth=True")
+        if not self._nvdr.cfg.use_color:
+            raise RuntimeError("CountLinemodPoseLoss 需要 camera.use_color=True")
+
+        h, w = int(self._nvdr.cfg.img_size[0]), int(self._nvdr.cfg.img_size[1])
+        fov = float(self._nvdr.cfg.fov)
+        fx = (w * 0.5) / np.tan(fov * 0.5)
+        fy = (h * 0.5) / np.tan(fov * 0.5)
+        cx = w * 0.5
+        cy = h * 0.5
+        self._intrinsics = self._CameraIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy)
+
+    @staticmethod
+    def _quat_to_rot(q_xyzw: np.ndarray) -> np.ndarray:
+        q = np.asarray(q_xyzw, dtype=np.float32).reshape(4)
+        x, y, z, w = [float(v) for v in q.tolist()]
+        n = x * x + y * y + z * z + w * w
+        if n < 1e-12:
+            return np.eye(3, dtype=np.float32)
+        s = 2.0 / n
+        xx, yy, zz = x * x * s, y * y * s, z * z * s
+        xy, xz, yz = x * y * s, x * z * s, y * z * s
+        wx, wy, wz = w * x * s, w * y * s, w * z * s
+        return np.asarray([
+            [1.0 - (yy + zz), xy - wz, xz + wy],
+            [xy + wz, 1.0 - (xx + zz), yz - wx],
+            [xz - wy, yz + wx, 1.0 - (xx + yy)],
+        ], dtype=np.float32)
+
+    @staticmethod
+    def _pose7_to_T(pose7: np.ndarray) -> np.ndarray:
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = CountLinemodPoseLoss._quat_to_rot(pose7[3:7])
+        T[:3, 3] = np.asarray(pose7[:3], dtype=np.float32)
+        return T
+
+    @staticmethod
+    def _rot_z(rad: float) -> np.ndarray:
+        c = float(np.cos(rad))
+        s = float(np.sin(rad))
+        return np.asarray(
+            [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+
+    def _symmetry_local_transforms(self, object_name: str):
+        name = str(object_name).lower()
+        out = [np.eye(4, dtype=np.float32)]
+        if name.startswith("cube"):
+            out = []
+            eye = np.eye(3, dtype=np.float32)
+            for perm in ((0, 1, 2), (0, 2, 1), (1, 0, 2),
+                         (1, 2, 0), (2, 0, 1), (2, 1, 0)):
+                p = eye[:, perm]
+                for sx in (-1.0, 1.0):
+                    for sy in (-1.0, 1.0):
+                        for sz in (-1.0, 1.0):
+                            s = np.diag([sx, sy, sz]).astype(np.float32)
+                            r = p @ s
+                            if np.linalg.det(r) > 0.0:
+                                T = np.eye(4, dtype=np.float32)
+                                T[:3, :3] = r
+                                out.append(T)
+            return out
+        if name.startswith("cuboid") or name.startswith("arch"):
+            T = np.eye(4, dtype=np.float32)
+            T[:3, :3] = self._rot_z(np.pi)
+            return [np.eye(4, dtype=np.float32), T]
+        if name.startswith("triangle"):
+            T = np.eye(4, dtype=np.float32)
+            T[:3, :3] = self._rot_z(np.pi)
+            return [np.eye(4, dtype=np.float32), T]
+        if name.startswith("semi_cylinder"):
+            T = np.eye(4, dtype=np.float32)
+            T[:3, :3] = self._rot_z(np.pi)
+            return [np.eye(4, dtype=np.float32), T]
+        if name.startswith("cylinder"):
+            out = []
+            n = 36
+            for k in range(n):
+                T = np.eye(4, dtype=np.float32)
+                T[:3, :3] = self._rot_z(2.0 * np.pi * (k / n))
+                out.append(T)
+            return out
+        return out
+
+    @staticmethod
+    def _rot_err_rad(Ra: np.ndarray, Rb: np.ndarray) -> float:
+        R = Ra.T @ Rb
+        tr = float(np.trace(R))
+        c = max(-1.0, min(1.0, (tr - 1.0) * 0.5))
+        return float(np.arccos(c))
+
+    def _best_symmetry_error(self, object_name: str, T_pred: np.ndarray, T_gt: np.ndarray):
+        best = None
+        for Ts in self._symmetry_local_transforms(object_name):
+            Tc = T_pred @ Ts
+            terr = float(np.linalg.norm(Tc[:3, 3] - T_gt[:3, 3]))
+            rerr = self._rot_err_rad(Tc[:3, :3], T_gt[:3, :3])
+            loss = terr + 0.05 * rerr
+            if best is None or loss < best[0]:
+                best = (loss, terr, rerr)
+        return best
+
+    def step(self, actions: th.Tensor):
+        obs, rew, done, info = self.env.step(actions)
+        done_ids = done.nonzero(as_tuple=False).view(-1)
+        if len(done_ids) <= 0:
+            return obs, rew, done, info
+
+        T_cam_all = dcn(self._nvdr.cam.renderer.T_pos)
+        colors = dcn(obs[self._nvdr.cfg.key_color])
+        depths = dcn(obs[self._nvdr.cfg.key_depth])
+        root = dcn(self.tensors['root'])
+        cur_ids = dcn(self.scene.cur_ids.long())
+
+        for env_id in done_ids.tolist():
+            self._num_total += 1
+            obj_name = str(self.scene.cur_names[env_id])
+
+            pose7 = root[cur_ids[env_id], :7]
+            T_world_obj = self._pose7_to_T(pose7)
+            T_cam = np.asarray(T_cam_all[env_id], dtype=np.float32)
+            T_cam_obj_gt = T_cam @ T_world_obj
+
+            rgb_chw = np.asarray(colors[env_id], dtype=np.float32)
+            if rgb_chw.ndim != 3 or rgb_chw.shape[0] != 3:
+                continue
+            rgb = np.transpose(rgb_chw, (1, 2, 0))
+            if rgb.max() <= 1.5:
+                rgb = np.clip(rgb * 255.0, 0, 255)
+            rgb_u8 = rgb.astype(np.uint8)[..., ::-1]  # RGB -> BGR
+
+            depth = np.asarray(depths[env_id], dtype=np.float32)
+            if depth.ndim == 3:
+                depth = depth[0]
+            depth = np.where(np.isfinite(depth), depth, 0.0).astype(np.float32)
+            valid_depth = depth > 0.0
+            if valid_depth.shape == rgb_u8.shape[:2]:
+                rgb_u8[~valid_depth] = 255  # match template white background
+
+            try:
+                T_pred = self._detect_object_pose(
+                    rgb=rgb_u8,
+                    depth=depth,
+                    object_name=obj_name,
+                    intrinsics=self._intrinsics,
+                    template_db=Path(self._template_db),
+                    depth_scale=1.0,
+                    match_threshold=self._match_threshold,
+                    use_icp=self._use_icp,
+                    block_assets_dir=Path(self._block_assets_dir),
+                )
+            except Exception as e:
+                reason = f"exception:{type(e).__name__}:{str(e)}"
+                self._fail_reasons[reason] = self._fail_reasons.get(reason, 0) + 1
+                T_pred = None
+            if T_pred is None:
+                self._fail_reasons['no_match'] = self._fail_reasons.get('no_match', 0) + 1
+                self._records.append({
+                    'object_name': obj_name,
+                    'detected': False
+                })
+                continue
+
+            self._num_detected += 1
+            loss, terr, rerr = self._best_symmetry_error(
+                obj_name,
+                np.asarray(T_pred, dtype=np.float32),
+                np.asarray(T_cam_obj_gt, dtype=np.float32)
+            )
+            self._records.append({
+                'object_name': obj_name,
+                'detected': True,
+                'loss': float(loss),
+                'trans_err_m': float(terr),
+                'rot_err_rad': float(rerr),
+                'rot_err_deg': float(np.degrees(rerr)),
+            })
+        return obs, rew, done, info
+
+    def save(self):
+        valid = [r for r in self._records if r.get('detected', False)]
+        miss = self._num_total - self._num_detected
+        print(f"[LINEMOD] total={self._num_total}, detected={self._num_detected}, miss={miss}")
+        if len(self._fail_reasons) > 0:
+            print("[LINEMOD] fail reasons:")
+            for k, v in sorted(self._fail_reasons.items(), key=lambda kv: kv[1], reverse=True)[:8]:
+                print(f"  - {k}: {v}")
+        if len(valid) > 0:
+            loss = float(np.mean([r['loss'] for r in valid]))
+            terr = float(np.mean([r['trans_err_m'] for r in valid]))
+            rdeg = float(np.mean([r['rot_err_deg'] for r in valid]))
+            print(f"[LINEMOD] mean loss={loss:.6f}, trans_err={terr:.6f}m, rot_err={rdeg:.3f}deg")
+            summary = {
+                'total': int(self._num_total),
+                'detected': int(self._num_detected),
+                'miss': int(miss),
+                'mean_loss': loss,
+                'mean_trans_err_m': terr,
+                'mean_rot_err_deg': rdeg,
+            }
+        else:
+            summary = {
+                'total': int(self._num_total),
+                'detected': int(self._num_detected),
+                'miss': int(miss),
+                'mean_loss': None,
+                'mean_trans_err_m': None,
+                'mean_rot_err_deg': None,
+            }
+        with open(str(self._save_dir / 'linemod_pose_loss_summary.json'), 'w') as f:
+            json.dump(summary, f)
+        with open(str(self._save_dir / 'linemod_pose_loss_records.pkl'), 'wb') as f:
+            pickle.dump(self._records, f)
 
 
 class Phase2Training(WrapperEnv):
