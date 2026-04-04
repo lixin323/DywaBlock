@@ -37,6 +37,15 @@ def _pose9d_from_se3(T: SE3) -> np.ndarray:
     return np.concatenate([pos, rot6d]).astype(np.float32)
 
 
+def _relative_pose9d_from_se3(goal_T: SE3, current_T: SE3) -> np.ndarray:
+    """goal * inv(current) -> pose9d, aligned with training rel_goal_gt."""
+    assert_se3(goal_T)
+    assert_se3(current_T)
+    T_rel = np.asarray(goal_T, dtype=np.float32) @ np.linalg.inv(np.asarray(current_T, dtype=np.float32))
+    assert_se3(T_rel)
+    return _pose9d_from_se3(T_rel)
+
+
 # ---------------------------------------------------------------------------
 #  Lightweight normalizer for deployment (no IsaacGym / gym dependency)
 # ---------------------------------------------------------------------------
@@ -179,6 +188,9 @@ class DywaStudentPolicyInterface:
         # ---- internal state ---------------------------------------------------
         self._action_size = int(student_cfg.action_size)
         self._use_gpcd = bool(student_cfg.use_gpcd)
+        self._infer_need_rel_goal_gt = bool(
+            getattr(student_cfg, "merge_pose_pred", False)
+        )
         self._prev_action = np.zeros((self._action_size,), dtype=np.float32)
         self._needs_reset = True
 
@@ -209,7 +221,10 @@ class DywaStudentPolicyInterface:
         assert_se3(T_nom)
 
         # 1) build & normalize observation
-        obs = self._build_obs(target_T_world_block)
+        obs = self._build_obs(
+            target_T=np.asarray(target_T_world_block, dtype=np.float32),
+            current_T=np.asarray(current_T_world_block, dtype=np.float32),
+        )
         obs = self._normalizer.normalize(obs)
 
         if self._use_gpcd:
@@ -247,8 +262,12 @@ class DywaStudentPolicyInterface:
 
     # ---- internals ------------------------------------------------------------
 
-    def _build_obs(self, target_T: SE3) -> Dict[str, th.Tensor]:
+    def _build_obs(self, target_T: SE3, current_T: SE3) -> Dict[str, th.Tensor]:
         abs_goal = _pose9d_from_se3(np.asarray(target_T, dtype=np.float32))
+        rel_goal_gt = _relative_pose9d_from_se3(
+            np.asarray(target_T, dtype=np.float32),
+            np.asarray(current_T, dtype=np.float32),
+        )
         hand = (
             np.asarray(self.cfg.get_hand_state(), dtype=np.float32).reshape(9)
             if self.cfg.get_hand_state
@@ -264,13 +283,20 @@ class DywaStudentPolicyInterface:
             if self.cfg.get_partial_cloud_world
             else np.zeros((self.cfg.cloud_n, 3), dtype=np.float32)
         )
-        return {
+        out: Dict[str, th.Tensor] = {
             "abs_goal": th.from_numpy(abs_goal[None, :]).to(self.device),
             "hand_state": th.from_numpy(hand[None, :]).to(self.device),
             "robot_state": th.from_numpy(robot[None, :]).to(self.device),
             "previous_action": th.from_numpy(self._prev_action[None, :].copy()).to(self.device),
             "partial_cloud": th.from_numpy(pc[None, :, :]).to(self.device),
         }
+        if self._infer_need_rel_goal_gt:
+            rel_goal_gt = _relative_pose9d_from_se3(
+                np.asarray(target_T, dtype=np.float32),
+                np.asarray(current_T, dtype=np.float32),
+            )
+            out["rel_goal_gt"] = th.from_numpy(rel_goal_gt[None, :]).to(self.device)
+        return out
 
     def _sample_cloud(self, pc: np.ndarray) -> np.ndarray:
         pc = np.asarray(pc, dtype=np.float32).reshape(-1, 3)

@@ -393,6 +393,7 @@ class FrankaInferenceNode(Node):
         self.ws_uri = f"ws://{args.policy_server_host}:{args.policy_server_port}"
         self.get_logger().info(f"DyWA Policy Server: {self.ws_uri}")
         self._ws = None
+        self._ws_ctx = None
         self._ws_lock = threading.Lock()
 
         csv = (args.t_base_cam_csv or "").strip()
@@ -675,29 +676,46 @@ class FrankaInferenceNode(Node):
             return
         if ws_connect_sync is None:
             raise RuntimeError("websockets.sync.client 不可用，无法建立长连接")
-        self._ws = ws_connect_sync(self.ws_uri, open_timeout=3.0, close_timeout=1.0)
+        # 兼容不同 websockets 版本：
+        # - 某些版本 connect() 直接返回连接对象
+        # - 某些版本 connect() 返回上下文管理器
+        self._ws_ctx = ws_connect_sync(self.ws_uri, open_timeout=3.0, close_timeout=1.0)
+        if hasattr(self._ws_ctx, "__enter__") and hasattr(self._ws_ctx, "__exit__"):
+            self._ws = self._ws_ctx.__enter__()
+        else:
+            self._ws = self._ws_ctx
         self.get_logger().info(f"[WS] 已连接 {self.ws_uri}")
 
     def _close_ws(self):
-        if self._ws is None:
+        if self._ws is None and self._ws_ctx is None:
             return
         try:
-            self._ws.close()
+            # 优先走上下文退出，保证底层资源完全释放
+            if self._ws_ctx is not None and hasattr(self._ws_ctx, "__exit__"):
+                self._ws_ctx.__exit__(None, None, None)
+            elif self._ws is not None:
+                self._ws.close()
         except Exception:
             pass
         finally:
             self._ws = None
+            self._ws_ctx = None
 
     def _request_server_sync(self, req: dict) -> dict:
         with self._ws_lock:
-            try:
-                self._ensure_ws_connected()
-                self._ws.send(json.dumps(req))
-                resp_raw = self._ws.recv()
-                return json.loads(resp_raw)
-            except Exception:
-                self._close_ws()
-                raise
+            for attempt in range(2):
+                try:
+                    self._ensure_ws_connected()
+                    self._ws.send(json.dumps(req))
+                    resp_raw = self._ws.recv()
+                    return json.loads(resp_raw)
+                except Exception as e:
+                    self._close_ws()
+                    if attempt == 0:
+                        self.get_logger().warn(f"[WS] 请求失败，重连后重试一次: {e}")
+                        continue
+                    raise
+        raise RuntimeError("WebSocket 请求失败")
 
     def destroy_node(self):
         """清理：释放视频文件，停止所有相机 pipeline"""

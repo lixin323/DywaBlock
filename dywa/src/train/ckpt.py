@@ -62,7 +62,26 @@ def load_ckpt(modules: Dict[str, Union[dict, th.nn.Module]],
             m = m.module
         try:
             if isinstance(m, th.nn.Module):
-                m.load_state_dict(save_dict[k],
+                state_to_load = save_dict[k]
+                if not strict:
+                    # 容忍 shape 不一致（例如相机分辨率变化导致 normalizer 统计维度变化）
+                    cur_state = m.state_dict()
+                    filtered = {}
+                    skipped = []
+                    for kk, vv in state_to_load.items():
+                        if kk not in cur_state:
+                            continue
+                        cv = cur_state[kk]
+                        if hasattr(vv, "shape") and hasattr(cv, "shape") and tuple(vv.shape) != tuple(cv.shape):
+                            skipped.append((kk, tuple(vv.shape), tuple(cv.shape)))
+                            continue
+                        filtered[kk] = vv
+                    if skipped:
+                        print(f"[load_ckpt] skip shape-mismatch keys in '{k}': {len(skipped)}")
+                        for sk, s0, s1 in skipped[:8]:
+                            print(f"  - {sk}: ckpt{s0} != model{s1}")
+                    state_to_load = filtered
+                m.load_state_dict(state_to_load,
                                   strict=strict)
             else:
                 m.load_state_dict(save_dict[k])

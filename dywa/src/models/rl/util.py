@@ -12,6 +12,19 @@ from util.torch_util import (
     dcn)
 
 
+def _set_foundationpose_replace_enabled(env, enabled: bool) -> bool:
+    cur = env
+    # 沿 wrapper 链查找 ReplaceObjectStateWithFoundationPose，避免在 mixed_reset 阶段调用 infer_pose。
+    for _ in range(128):
+        if cur is None:
+            break
+        if cur.__class__.__name__ == "ReplaceObjectStateWithFoundationPose" and hasattr(cur, "set_enabled"):
+            cur.set_enabled(bool(enabled))
+            return True
+        cur = getattr(cur, "env", None)
+    return False
+
+
 def explained_variance(y_pred: th.Tensor, y_true: th.Tensor) -> th.Tensor:
     v_pred = th.var(y_true)
     return 1.0 - th.var(y_true - y_pred) / v_pred
@@ -43,26 +56,31 @@ def mixed_reset(env,
     n_reset: int = max(1, num_env // num_steps) ### env / 300
     # The Reset interval.
     stride: int = max(1, num_steps // num_env) ### 300 / env
-    for i in tqdm(range(num_steps), desc='mixed_reset'):
-        if i % stride == 0:
-            indices = th.randint(num_env, size=(n_reset,),
-                                 device=device) ### 随机选一些reset
-            # FIXME:
-            # `reset_indexed` results in double resets,
-            # so we indirectly work around this by
-            # overwriting the `done` buffer instead.
-            # env.reset_indexed(indices=indices)
-            if hasattr(env, 'buffers'):
-                env.buffers['done'][indices] = 1
+    disabled_fp = _set_foundationpose_replace_enabled(env, False)
+    try:
+        for i in tqdm(range(num_steps), desc='mixed_reset'):
+            if i % stride == 0:
+                indices = th.randint(num_env, size=(n_reset,),
+                                     device=device) ### 随机选一些reset
+                # FIXME:
+                # `reset_indexed` results in double resets,
+                # so we indirectly work around this by
+                # overwriting the `done` buffer instead.
+                # env.reset_indexed(indices=indices)
+                if hasattr(env, 'buffers'):
+                    env.buffers['done'][indices] = 1
 
-        if hasattr(env, 'action_space'):
-            actions = np.stack([env.action_space.sample()
-                                for _ in range(num_env)])
-            actions = th.as_tensor(actions, device=env.device)
-        else:
-            actions = None
-        obs, _, _, _ = env.step(actions)
-    return obs
+            if hasattr(env, 'action_space'):
+                actions = np.stack([env.action_space.sample()
+                                    for _ in range(num_env)])
+                actions = th.as_tensor(actions, device=env.device)
+            else:
+                actions = None
+            obs, _, _, _ = env.step(actions)
+        return obs
+    finally:
+        if disabled_fp:
+            _set_foundationpose_replace_enabled(env, True)
 
 
 def test_mixed_reset():

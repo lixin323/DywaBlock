@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from typing import Tuple, Optional, Callable
+from typing import Tuple, Optional, Callable, List
 
 from isaacgym import gymtorch
 from isaacgym import gymapi
@@ -29,8 +29,6 @@ from util.vis.img import tile_images, to_hwc
 
 import cv2
 
-from icecream import ic
-
 
 class NvdrRecordEpisode(WrapperEnv):
     """
@@ -44,8 +42,8 @@ class NvdrRecordEpisode(WrapperEnv):
         img_size: Tuple[int, int] = (256, 256)
         cam_eye: Tuple[float, float, float] = (0.54, 0.0, 0.9)
         cam_at: Tuple[float, float, float] = (-0.2, 0.0, 0.4)
-        # NOTE: render `visual mesh` for objects, by default.
-        use_col: bool = True
+        # False: URDF visual + 材质/贴图，RGB 更彩；True: 碰撞网格，RGB 常发灰、像黑白
+        use_col: bool = False
 
         video_fps: int = 30
 
@@ -81,6 +79,8 @@ class NvdrRecordEpisode(WrapperEnv):
             dtype=np.uint8)
         self.__index = np.zeros((env.num_env,),
                                 dtype=np.int32)
+        self._roll_chunks: List[List[np.ndarray]] = [
+            [] for _ in range(env.num_env)]
         self.project = ApplyCameraTransform()
         self.project.reset(self)
 
@@ -92,26 +92,45 @@ class NvdrRecordEpisode(WrapperEnv):
     def action_space(self):
         return self.env.action_space
 
-    def __export_episode(self, images: np.ndarray, count: int, env_id: int = 0):
+    def __clear_record_buffer(self, env_id: int) -> None:
+        self._roll_chunks[env_id].clear()
+        self.__index[env_id] = 0
+
+    def __flush_full_chunk(self, env_id: int) -> None:
+        n_cap = int(self.__images.shape[0])
+        self._roll_chunks[env_id].append(
+            self.__images[:n_cap, env_id].copy())
+        self.__index[env_id] = 0
+
+    def __export_episode(self, images_hwc: np.ndarray, env_id: int = 0):
+        count = int(images_hwc.shape[0])
         if count <= 0:
             return
         out_dir = ensure_directory(
             self._record_dir /
             F'env_{env_id:04d}')
-        ic(count)
-        # for i in range(count):
-        #     cv2.imwrite(F'{out_dir}/{i:04d}.png', images[i])
-        
         video_path = out_dir / f'episode_{self.eps_count_batch[env_id]:04d}.mp4'
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        height, width = images.shape[1:3]
-        self.video_writer = cv2.VideoWriter(str(video_path), fourcc, self.cfg.video_fps, (width, height))
-        for frame in images[:count]:
+        height, width = images_hwc.shape[1:3]
+        self.video_writer = cv2.VideoWriter(
+            str(video_path), fourcc, self.cfg.video_fps, (width, height))
+        for frame in images_hwc:
             self.video_writer.write(frame)
         self.video_writer.release()
 
-        # self.__eps_count += 1
-        self.eps_count_batch[env_id] +=1
+        self.eps_count_batch[env_id] += 1
+
+    def __export_episode_merged(self, env_id: int) -> None:
+        idx = int(self.__index[env_id])
+        parts = list(self._roll_chunks[env_id])
+        if idx > 0:
+            parts.append(self.__images[:idx, env_id].copy())
+        self._roll_chunks[env_id].clear()
+        self.__index[env_id] = 0
+        if not parts:
+            return
+        full = np.concatenate(parts, axis=0)
+        self.__export_episode(full, env_id)
 
     def __get_lines(self, lines) -> Tuple[np.ndarray, np.ndarray]:
         vss = []
@@ -176,8 +195,17 @@ class NvdrRecordEpisode(WrapperEnv):
                         thickness=1
                     )
 
-        self.__images[self.__index, th.arange(self.env.num_env)] = rgb_imgs_np
-        self.__index += 1
+        # 缓冲区长度为 env.timeout；满则把整段推到 _roll_chunks 并复位写入指针，避免越界；回合结束再拼接导出一条 mp4
+        n_cap = int(self.__images.shape[0])
+        env_ids = np.arange(self.env.num_env, dtype=np.int32)
+        valid = self.__index < n_cap
+        if np.any(valid):
+            self.__images[self.__index[valid], env_ids[valid]] = rgb_imgs_np[valid]
+        self.__index[valid] += 1
+        overflow = self.__index >= n_cap
+        if np.any(overflow):
+            for e in np.where(overflow)[0]:
+                self.__flush_full_chunk(int(e))
 
         # Process episodes.
         sel = None
@@ -189,17 +217,14 @@ class NvdrRecordEpisode(WrapperEnv):
             sel = ~info['success']
 
         for env_id in np.argwhere(done_np).ravel():
-            if self.env.buffers['step'][env_id] < 30:
+            e = int(env_id)
+            if self.env.buffers['step'][e] < 30:
+                self.__clear_record_buffer(e)
                 continue
-            if (sel is not None) and (not sel[env_id]):
+            if (sel is not None) and (not sel[e]):
+                self.__clear_record_buffer(e)
                 continue
-            self.__export_episode(
-                self.__images[:, env_id],
-                self.__index[env_id],
-                env_id)
-
-        # Reset counts for completed episodes.
-        self.__index[done_np] = 0
+            self.__export_episode_merged(e)
 
     def step(self, *args, **kwds):
         # Step original env.

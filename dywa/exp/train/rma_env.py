@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 
 import copy
-from typing import Optional, Tuple, List
+import pickle
+from pathlib import Path
+from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
 
 from env.env.wrap.normalize_env import NormalizeEnv
 from util.math_util import matrix_to_pose9d, pose7d_to_matrix, pose9d_to_matrix
 import torch as th
 import einops
+import numpy as np
 from gym import spaces
 
 from env.env.wrap.base import (add_obs_field,
@@ -554,6 +557,90 @@ class AddInitialGoalCloud(ObservationWrapper):
         return obs
 
 
+class AddRecordedGoalCloud(ObservationWrapper):
+    """
+    从磁盘读取预录制 goal_cloud 字典，并按 object_name 直接写入 goal_cloud。
+    这会替代 AddInitialRelGoal / AddInitialGoalCloud 链路。
+    """
+
+    @dataclass
+    class Config:
+        pkl_path: str = "/home/user/DyWA/output/goal_clouds/goal_cloud_dict.pkl"
+        dst_key: str = "goal_cloud"
+        src_key_for_norm: str = "partial_cloud"
+        cloud_size: int = 512
+
+    def __init__(self, cfg: Config, env):
+        super().__init__(env, self._wrap_obs)
+        self.cfg = cfg
+
+        obs_space = env.observation_space
+        cloud_space = spaces.Box(-float('inf'),
+                                 +float('inf'),
+                                 shape=(cfg.cloud_size, 3))
+        self._obs_space, self._update_fn = add_obs_field(
+            obs_space,
+            cfg.dst_key,
+            cloud_space)
+
+        self._goal_cloud_dict: Dict[str, np.ndarray] = {}
+        p = Path(cfg.pkl_path)
+        if not p.exists():
+            raise FileNotFoundError(f"goal cloud dict not found: {p}")
+        with open(str(p), "rb") as f:
+            raw = pickle.load(f)
+        if not isinstance(raw, dict) or len(raw) == 0:
+            raise RuntimeError(f"invalid goal cloud dict in {p}")
+        for k, v in raw.items():
+            key = str(k)
+            arr = np.asarray(v, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[-1] != 3 or arr.shape[0] <= 0:
+                raise RuntimeError(f"invalid cloud for key={key}: shape={arr.shape}")
+            self._goal_cloud_dict[key] = arr
+            self._goal_cloud_dict[key.lower()] = arr
+
+        normalizer = self.unwrap(target=NormalizeEnv).normalizer
+        normalizer.obs_rms[self.cfg.dst_key] = copy.deepcopy(
+            normalizer.obs_rms[self.cfg.src_key_for_norm]
+        )
+
+    @property
+    def observation_space(self):
+        return self._obs_space
+
+    def _sample_cloud(self, cloud: np.ndarray) -> np.ndarray:
+        n = int(self.cfg.cloud_size)
+        m = int(cloud.shape[0])
+        if m == n:
+            return cloud
+        if m > n:
+            idx = np.random.choice(m, size=n, replace=False)
+            return cloud[idx]
+        idx = np.random.choice(m, size=n, replace=True)
+        return cloud[idx]
+
+    def _wrap_obs(self, obs):
+        names = [str(n) for n in self.scene.cur_names]
+        out = th.zeros((self.num_env, self.cfg.cloud_size, 3),
+                       dtype=obs[self.cfg.src_key_for_norm].dtype,
+                       device=obs[self.cfg.src_key_for_norm].device)
+
+        for i, name in enumerate(names):
+            cloud = self._goal_cloud_dict.get(name)
+            if cloud is None:
+                cloud = self._goal_cloud_dict.get(name.lower())
+            if cloud is None:
+                raise KeyError(f"goal_cloud missing key: {name}")
+            sampled = self._sample_cloud(cloud)
+            out[i] = th.as_tensor(sampled, dtype=out.dtype, device=out.device)
+
+        norm = self.unwrap(target=NormalizeEnv)
+        t_obs = {self.cfg.dst_key: out.clone()}
+        out_norm = norm.normalizer.normalize_obs(t_obs)[self.cfg.dst_key]
+        obs = self._update_fn(obs, out_norm)
+        return obs
+
+
 class ShuffleCloud(ObservationWrapper):
     @dataclass
     class Config:
@@ -619,6 +706,8 @@ def setup_rma_env_v2(cfg, env, agent,
             #     update_obs_bound('initial_rel_goal',
             #                     OBS_BOUND_MAP.get('relpose'))
             env = AddInitialGoalCloud(cfg.initial_goal_cloud, env)
+        elif cfg.goal_cloud_type == 'recorded':
+            env = AddRecordedGoalCloud(cfg.recorded_goal_cloud, env)
         else:
             raise NotImplementedError(cfg.goal_cloud_type)
     if cfg.use_shuffle_cloud:

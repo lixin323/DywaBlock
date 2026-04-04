@@ -17,10 +17,12 @@ from env.env.wrap.base import (ObservationWrapper,
 from omegaconf import OmegaConf
 from env.env.wrap.record_viewer import RecordViewer
 # from env.env.wrap.nvdr_record_viewer import NvdrRecordViewer
-# from env.env.wrap.nvdr_record_episode import NvdrRecordEpisode
+from env.env.wrap.nvdr_record_episode import NvdrRecordEpisode
 from envs.cube_env_wrappers import (CountCategoricalSuccess,
                                     ScenarioTest,
-                                    CountLinemodPoseLoss
+                                    CountLinemodPoseLoss,
+                                    CountFoundationPoseAccuracy,
+                                    ReplaceObjectStateWithFoundationPose
                                     )
 
 from env.env.wrap.reset_ig_camera import reset_ig_camera
@@ -103,6 +105,16 @@ class Config(RMAConfig):
     linemod_block_assets_dir: str = "/home/user/DyWA/block_data/block_assets"
     linemod_match_threshold: float = 60.0
     linemod_use_icp: bool = False
+    log_foundationpose_accuracy: bool = False
+    foundationpose_eval_url: str = "http://127.0.0.1:18080/eval_pose"
+    foundationpose_replace_object_state: bool = False
+    foundationpose_pose_url: str = "http://127.0.0.1:18080/infer_pose"
+    foundationpose_input_h: int = 128
+    foundationpose_input_w: int = 128
+    foundationpose_trans_thresh_m: float = 0.05
+    foundationpose_rot_thresh_rad: float = 0.2
+    foundationpose_eval_use_icp: bool = True
+    foundationpose_goal_cloud_dict_path: str = "/home/user/DyWA/output/goal_clouds/goal_cloud_dict.pkl"
     use_log_episode: bool = False
     draw_debug_lines: bool = False
     log_episode: LogEpisodes.Config = LogEpisodes.Config()
@@ -205,9 +217,15 @@ def main(cfg: Config):
     # path, writer = None, None
     _ = set_seed(cfg.env.seed)
 
+    if cfg.use_nvdr_record_episode or cfg.use_nvdr_record_viewer:
+        cfg.env.track_debug_lines = True
+
     cfg, env = load_env(cfg, path, freeze_env=True,
                         check_viewer=False
                         )
+    if cfg.use_nvdr_record_episode:
+        env = NvdrRecordEpisode(cfg.nvdr_record_episode, env, hide_arm=False)
+
     env.unwrap(target=AddTensorboardWriter).set_writer(writer)
     
     if cfg.use_log_episode:
@@ -223,6 +241,22 @@ def main(cfg: Config):
             match_threshold=cfg.linemod_match_threshold,
             use_icp=cfg.linemod_use_icp
         )
+    if cfg.foundationpose_replace_object_state:
+        env = ReplaceObjectStateWithFoundationPose(
+            env,
+            service_url=cfg.foundationpose_pose_url,
+            input_hw=(cfg.foundationpose_input_h, cfg.foundationpose_input_w),
+        )
+    if cfg.log_foundationpose_accuracy:
+        env = CountFoundationPoseAccuracy(
+            env,
+            service_url=cfg.foundationpose_eval_url,
+            input_hw=(cfg.foundationpose_input_h, cfg.foundationpose_input_w),
+            trans_thresh_m=cfg.foundationpose_trans_thresh_m,
+            rot_thresh_rad=cfg.foundationpose_rot_thresh_rad,
+            use_icp_success=cfg.foundationpose_eval_use_icp,
+            goal_cloud_dict_path=cfg.foundationpose_goal_cloud_dict_path,
+        )
 
     if cfg.test_scenario:
         env = ScenarioTest(env)
@@ -230,9 +264,13 @@ def main(cfg: Config):
     # Update cfg elements from `env`.
     if not cfg.train_student_policy:
         state_blocklist = list(cfg.state_net_blocklist)
-        if cfg.log_linemod_loss and ('color' not in state_blocklist):
-            # `color` is only used by LINEMOD evaluator, not policy input.
-            state_blocklist.append('color')
+        # Teacher state_net 不含 RGB head：仿真里 camera.use_color、Nvdr 录制等会把 `color`
+        # 放进 obs，必须从 net 的 obs_space 剔除，否则 generic_state_encoder 会对 color 报
+        # ValueError: Invalid cfg = (3, H, W), None
+        obs_sp = env.observation_space
+        if isinstance(obs_sp, spaces.Dict) and 'color' in obs_sp.spaces:
+            if 'color' not in state_blocklist:
+                state_blocklist.append('color')
         cfg = replace(cfg, net=update_net_cfg(cfg.net, env,
                                               state_blocklist))
         # load teacher
@@ -300,9 +338,16 @@ def main(cfg: Config):
         _ls_base = _ls if _ls.is_dir() else _ls.parent
         env_ckpt = _ls_base / '../stat/env-last.ckpt'
     if env_ckpt.is_file():
-        # LINEMOD online eval may add camera color observation keys that are
-        # absent in legacy normalizer stats checkpoints.
-        env_load_strict = (not cfg.log_linemod_loss)
+        # Pose online eval / camera.use_color / Nvdr 录制等会让 obs 含 `color`，而旧 stat
+        # ckpt 往往没有 obs_rms.color.*；strict 加载会报 Missing key(s)。
+        _osp_load = env.observation_space
+        _obs_has_color = isinstance(_osp_load, spaces.Dict) and 'color' in _osp_load.spaces
+        env_load_strict = (not (cfg.log_linemod_loss or
+                                cfg.log_foundationpose_accuracy or
+                                cfg.foundationpose_replace_object_state or
+                                cfg.use_nvdr_record_episode or
+                                cfg.use_nvdr_record_viewer or
+                                _obs_has_color))
         env.load(env_ckpt, strict=env_load_strict)
     else:
         raise ValueError
@@ -415,6 +460,8 @@ def main(cfg: Config):
                 env.unwrap(target=CountCategoricalSuccess).save()
             if cfg.log_linemod_loss:
                 env.unwrap(target=CountLinemodPoseLoss).save()
+            if cfg.log_foundationpose_accuracy:
+                env.unwrap(target=CountFoundationPoseAccuracy).save()
 
 
 if __name__ == '__main__':

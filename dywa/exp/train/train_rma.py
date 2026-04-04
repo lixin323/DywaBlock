@@ -47,6 +47,7 @@ from train.hf_hub import upload_ckpt
 
 from rma_env import (
     AddInitialGoalCloud,
+    AddRecordedGoalCloud,
     AddRelGoalCloud,
     ShuffleCloud,
     setup_rma_env_v2,
@@ -343,6 +344,7 @@ class Config(TrainConfig):
     use_goal_cloud: bool = False
     goal_cloud_type: Optional[str] = None
     rel_goal_cloud: AddRelGoalCloud.Config = AddRelGoalCloud.Config()
+    recorded_goal_cloud: AddRecordedGoalCloud.Config = AddRecordedGoalCloud.Config()
 
     add_init_cloud: bool = False
     add_init_rel_goal: bool = False

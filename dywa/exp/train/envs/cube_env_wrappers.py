@@ -66,6 +66,11 @@ from omegaconf import OmegaConf
 import sys
 import logging
 import json
+import base64
+import zlib
+import urllib.request
+import urllib.error
+import cv2
 
 try:
     # sys.path.append("/tmp/point2vec/")
@@ -1961,6 +1966,470 @@ class CountLinemodPoseLoss(WrapperEnv):
         with open(str(self._save_dir / 'linemod_pose_loss_summary.json'), 'w') as f:
             json.dump(summary, f)
         with open(str(self._save_dir / 'linemod_pose_loss_records.pkl'), 'wb') as f:
+            pickle.dump(self._records, f)
+
+
+class ReplaceObjectStateWithFoundationPose(ObservationWrapper):
+    """
+    用 FoundationPose 估计结果覆盖观测中的 object_state(7D)。
+    """
+    def __init__(
+        self,
+        env: EnvIface,
+        service_url: str = "http://127.0.0.1:18080/infer_pose",
+        input_hw: Tuple[int, int] = (128, 128),
+    ):
+        super().__init__(env, self._wrap_obs)
+        self._service_url = str(service_url)
+        self._enabled = True
+        self._input_h = int(input_hw[0])
+        self._input_w = int(input_hw[1])
+        self._obs_space = env.observation_space
+
+        self._nvdr = env.unwrap(target=NvdrCameraWrapper)
+        if self._nvdr is None:
+            raise RuntimeError("ReplaceObjectStateWithFoundationPose 需要 NvdrCameraWrapper")
+        if not self._nvdr.cfg.use_depth:
+            raise RuntimeError("ReplaceObjectStateWithFoundationPose 需要 camera.use_depth=True")
+        if not self._nvdr.cfg.use_color:
+            raise RuntimeError("ReplaceObjectStateWithFoundationPose 需要 camera.use_color=True")
+
+        h, w = int(self._nvdr.cfg.img_size[0]), int(self._nvdr.cfg.img_size[1])
+        fov = float(self._nvdr.cfg.fov)
+        self._fx = (w * 0.5) / np.tan(fov * 0.5)
+        self._fy = (h * 0.5) / np.tan(fov * 0.5)
+        self._cx = w * 0.5
+        self._cy = h * 0.5
+        self._src_h = int(h)
+        self._src_w = int(w)
+
+    @property
+    def observation_space(self):
+        return self._obs_space
+
+    def set_enabled(self, enabled: bool):
+        self._enabled = bool(enabled)
+
+    def _post_infer(self, payload: dict) -> dict:
+        req = urllib.request.Request(
+            self._service_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _wrap_obs(self, obs):
+        if not self._enabled:
+            return obs
+        if "object_state" not in obs:
+            return obs
+
+        obj_state = obs["object_state"].clone()
+        T_cam_all = dcn(self._nvdr.cam.renderer.T_pos)
+        colors = dcn(obs[self._nvdr.cfg.key_color])
+        depths = dcn(obs[self._nvdr.cfg.key_depth])
+        num_env = int(obj_state.shape[0])
+
+        for env_id in range(num_env):
+            obj_name = str(self.scene.cur_names[env_id])
+            rgb_chw = np.asarray(colors[env_id], dtype=np.float32)
+            if rgb_chw.ndim != 3 or rgb_chw.shape[0] != 3:
+                continue
+            rgb = np.transpose(rgb_chw, (1, 2, 0))
+            if rgb.max() <= 1.5:
+                rgb = np.clip(rgb * 255.0, 0, 255)
+            rgb_u8 = rgb.astype(np.uint8)[..., ::-1]  # RGB->BGR
+
+            depth = np.asarray(depths[env_id], dtype=np.float32)
+            if depth.ndim == 3:
+                depth = depth[0]
+            depth = np.where(np.isfinite(depth), depth, 0.0).astype(np.float32)
+            depth_u16 = np.clip(depth * 1000.0, 0, 65535).astype(np.uint16)
+
+            # 直接发送原始相机图像与原始内参，不做 resize。
+            fx, fy, cx, cy = float(self._fx), float(self._fy), float(self._cx), float(self._cy)
+
+            ok, enc = cv2.imencode(".jpg", rgb_u8, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if not ok:
+                continue
+            payload = {
+                "object_name": obj_name,
+                "image_width": int(rgb_u8.shape[1]),
+                "image_height": int(rgb_u8.shape[0]),
+                "fx": fx,
+                "fy": fy,
+                "cx": cx,
+                "cy": cy,
+                "depth_scale": 0.001,
+                "rgb_jpeg_b64": base64.b64encode(enc.tobytes()).decode("ascii"),
+                "depth_zlib_b64": base64.b64encode(zlib.compress(depth_u16.tobytes())).decode("ascii"),
+            }
+            try:
+                out = self._post_infer(payload)
+                if not bool(out.get("ok", False)):
+                    continue
+                T_cam_obj = np.asarray(out.get("T_cam_obj", []), dtype=np.float32).reshape(4, 4)
+                T_cam_world = np.asarray(T_cam_all[env_id], dtype=np.float32).reshape(4, 4)
+                T_world_obj = np.linalg.inv(T_cam_world) @ T_cam_obj
+                q = quaternion_from_matrix(
+                    th.as_tensor(T_world_obj[:3, :3][None], dtype=obj_state.dtype, device=obj_state.device)
+                )[0]
+                t = th.as_tensor(T_world_obj[:3, 3], dtype=obj_state.dtype, device=obj_state.device)
+                obj_state[env_id, 0:3] = t
+                obj_state[env_id, 3:7] = q
+            except Exception:
+                continue
+
+        out_obs = dict(obs)
+        out_obs["object_state"] = obj_state
+        return out_obs
+
+
+class CountFoundationPoseAccuracy(WrapperEnv):
+    def __init__(
+        self,
+        env: EnvIface,
+        service_url: str = "http://127.0.0.1:18080/eval_pose",
+        input_hw: Tuple[int, int] = (128, 128),
+        trans_thresh_m: float = 0.05,
+        rot_thresh_rad: float = 0.1,
+        use_icp_success: bool = False,
+        goal_cloud_dict_path: str = "/home/user/DyWA/output/goal_clouds/goal_cloud_dict.pkl",
+    ):
+        super().__init__(env)
+        self._save_dir: Path = ensure_directory(
+            '/home/user/DyWA/output/test_rma/dywa/result/foundationpose'
+        )
+        self._service_url = str(service_url)
+        self._input_h = int(input_hw[0])
+        self._input_w = int(input_hw[1])
+        self._trans_thresh_m = float(trans_thresh_m)
+        self._rot_thresh_rad = float(rot_thresh_rad)
+        self._use_icp_success = bool(use_icp_success)
+        self._goal_cloud_dict_path = str(goal_cloud_dict_path)
+        self._records = []
+        self._num_total = 0
+        self._num_correct = 0
+        self._num_success_http = 0
+        self._fail_reasons = {}
+        self._per_obj = {}
+
+        self._nvdr = env.unwrap(target=NvdrCameraWrapper)
+        if self._nvdr is None:
+            raise RuntimeError("CountFoundationPoseAccuracy 需要 NvdrCameraWrapper")
+        if not self._nvdr.cfg.use_depth:
+            raise RuntimeError("CountFoundationPoseAccuracy 需要 camera.use_depth=True")
+        if not self._nvdr.cfg.use_color:
+            raise RuntimeError("CountFoundationPoseAccuracy 需要 camera.use_color=True")
+
+        h, w = int(self._nvdr.cfg.img_size[0]), int(self._nvdr.cfg.img_size[1])
+        fov = float(self._nvdr.cfg.fov)
+        self._fx = (w * 0.5) / np.tan(fov * 0.5)
+        self._fy = (h * 0.5) / np.tan(fov * 0.5)
+        self._cx = w * 0.5
+        self._cy = h * 0.5
+        self._src_h = int(h)
+        self._src_w = int(w)
+        self._goal_cloud_dict = {}
+        if self._use_icp_success:
+            p = Path(self._goal_cloud_dict_path)
+            if not p.exists():
+                raise FileNotFoundError(f"goal cloud dict not found: {p}")
+            with open(str(p), "rb") as f:
+                raw = pickle.load(f)
+            if not isinstance(raw, dict) or len(raw) == 0:
+                raise RuntimeError(f"invalid goal cloud dict: {p}")
+            for k, v in raw.items():
+                arr = np.asarray(v, dtype=np.float32)
+                if arr.ndim != 2 or arr.shape[-1] != 3 or arr.shape[0] <= 0:
+                    continue
+                key = str(k)
+                self._goal_cloud_dict[key] = arr
+                self._goal_cloud_dict[key.lower()] = arr
+
+    @staticmethod
+    def _quat_to_rot(q_xyzw: np.ndarray) -> np.ndarray:
+        q = np.asarray(q_xyzw, dtype=np.float32).reshape(4)
+        x, y, z, w = [float(v) for v in q.tolist()]
+        n = x * x + y * y + z * z + w * w
+        if n < 1e-12:
+            return np.eye(3, dtype=np.float32)
+        s = 2.0 / n
+        xx, yy, zz = x * x * s, y * y * s, z * z * s
+        xy, xz, yz = x * y * s, x * z * s, y * z * s
+        wx, wy, wz = w * x * s, w * y * s, w * z * s
+        return np.asarray([
+            [1.0 - (yy + zz), xy - wz, xz + wy],
+            [xy + wz, 1.0 - (xx + zz), yz - wx],
+            [xz - wy, yz + wx, 1.0 - (xx + yy)],
+        ], dtype=np.float32)
+
+    @staticmethod
+    def _pose7_to_T(pose7: np.ndarray) -> np.ndarray:
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = CountFoundationPoseAccuracy._quat_to_rot(pose7[3:7])
+        T[:3, 3] = np.asarray(pose7[:3], dtype=np.float32)
+        return T
+
+    @staticmethod
+    def _rot_z(rad: float) -> np.ndarray:
+        c = float(np.cos(rad))
+        s = float(np.sin(rad))
+        return np.asarray([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+
+    def _symmetry_local_transforms(self, object_name: str):
+        name = str(object_name).lower()
+        out = [np.eye(4, dtype=np.float32)]
+        if name.startswith("cube"):
+            out = []
+            eye = np.eye(3, dtype=np.float32)
+            for perm in ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)):
+                p = eye[:, perm]
+                for sx in (-1.0, 1.0):
+                    for sy in (-1.0, 1.0):
+                        for sz in (-1.0, 1.0):
+                            r = p @ np.diag([sx, sy, sz]).astype(np.float32)
+                            if np.linalg.det(r) > 0.0:
+                                T = np.eye(4, dtype=np.float32)
+                                T[:3, :3] = r
+                                out.append(T)
+            return out
+        if name.startswith("cuboid") or name.startswith("arch") or name.startswith("triangle") or name.startswith("semi_cylinder"):
+            T = np.eye(4, dtype=np.float32)
+            T[:3, :3] = self._rot_z(np.pi)
+            return [np.eye(4, dtype=np.float32), T]
+        if name.startswith("cylinder"):
+            out = []
+            for k in range(36):
+                T = np.eye(4, dtype=np.float32)
+                T[:3, :3] = self._rot_z(2.0 * np.pi * (k / 36.0))
+                out.append(T)
+            return out
+        return out
+
+    @staticmethod
+    def _rot_err_rad(Ra: np.ndarray, Rb: np.ndarray) -> float:
+        R = Ra.T @ Rb
+        tr = float(np.trace(R))
+        c = max(-1.0, min(1.0, (tr - 1.0) * 0.5))
+        return float(np.arccos(c))
+
+    def _best_symmetry_error(self, object_name: str, T_pred: np.ndarray, T_gt: np.ndarray):
+        best = None
+        for Ts in self._symmetry_local_transforms(object_name):
+            Tc = T_pred @ Ts
+            terr = float(np.linalg.norm(Tc[:3, 3] - T_gt[:3, 3]))
+            rerr = self._rot_err_rad(Tc[:3, :3], T_gt[:3, :3])
+            loss = terr + 0.05 * rerr
+            if best is None or loss < best[0]:
+                best = (loss, terr, rerr)
+        return best
+
+    def _sample_goal_cloud(self, object_name: str, n_points: int) -> np.ndarray:
+        cloud = self._goal_cloud_dict.get(str(object_name))
+        if cloud is None:
+            cloud = self._goal_cloud_dict.get(str(object_name).lower())
+        if cloud is None:
+            raise KeyError(f"goal cloud missing key: {object_name}")
+        m = int(cloud.shape[0])
+        if m == n_points:
+            return cloud
+        if m > n_points:
+            idx = np.random.choice(m, size=n_points, replace=False)
+        else:
+            idx = np.random.choice(m, size=n_points, replace=True)
+        return cloud[idx]
+
+    def _icp_error_to_goal(self, object_name: str, goal_cloud: np.ndarray, cur_cloud: np.ndarray):
+        src = th.as_tensor(goal_cloud[None], dtype=th.float, device=self.device)
+        dst = th.as_tensor(cur_cloud[None], dtype=th.float, device=self.device)
+        sol = iterative_closest_point(src, dst, max_iterations=24)
+        # pytorch3d 输出满足 X @ R + t = Y，这里的 R 实际是转置形式。
+        R = sol.RTs.R[0].swapaxes(-1, -2).detach().cpu().numpy().astype(np.float32)
+        t = sol.RTs.T[0].detach().cpu().numpy().astype(np.float32)
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = R
+        T[:3, 3] = t
+        best = None
+        I = np.eye(4, dtype=np.float32)
+        for Ts in self._symmetry_local_transforms(object_name):
+            Tc = T @ Ts
+            terr = float(np.linalg.norm(Tc[:3, 3] - I[:3, 3]))
+            rerr = self._rot_err_rad(Tc[:3, :3], I[:3, :3])
+            loss = terr + 0.05 * rerr
+            if best is None or loss < best[0]:
+                best = (loss, terr, rerr)
+        return best[1], best[2]
+
+    def _post_eval(self, payload: dict) -> dict:
+        req = urllib.request.Request(
+            self._service_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def step(self, actions: th.Tensor):
+        obs, rew, done, info = self.env.step(actions)
+        done_ids = done.nonzero(as_tuple=False).view(-1)
+        if len(done_ids) <= 0:
+            return obs, rew, done, info
+
+        T_cam_all = dcn(self._nvdr.cam.renderer.T_pos)
+        colors = dcn(obs[self._nvdr.cfg.key_color])
+        depths = dcn(obs[self._nvdr.cfg.key_depth])
+        root = dcn(self.tensors['root'])
+        cur_ids = dcn(self.scene.cur_ids.long())
+
+        for env_id in done_ids.tolist():
+            self._num_total += 1
+            obj_name = str(self.scene.cur_names[env_id])
+
+            pose7 = root[cur_ids[env_id], :7]
+            T_world_obj = self._pose7_to_T(pose7)
+            T_cam = np.asarray(T_cam_all[env_id], dtype=np.float32)
+            T_cam_obj_gt = T_cam @ T_world_obj
+
+            rgb_chw = np.asarray(colors[env_id], dtype=np.float32)
+            if rgb_chw.ndim != 3 or rgb_chw.shape[0] != 3:
+                continue
+            rgb = np.transpose(rgb_chw, (1, 2, 0))
+            if rgb.max() <= 1.5:
+                rgb = np.clip(rgb * 255.0, 0, 255)
+            rgb_u8 = rgb.astype(np.uint8)[..., ::-1]  # RGB -> BGR
+
+            depth = np.asarray(depths[env_id], dtype=np.float32)
+            if depth.ndim == 3:
+                depth = depth[0]
+            depth = np.where(np.isfinite(depth), depth, 0.0).astype(np.float32)
+            depth_u16 = np.clip(depth * 1000.0, 0, 65535).astype(np.uint16)
+
+            # 直接发送原始相机图像与原始内参，不做 resize。
+            fx, fy, cx, cy = float(self._fx), float(self._fy), float(self._cx), float(self._cy)
+
+            ok, enc = cv2.imencode(".jpg", rgb_u8, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if not ok:
+                reason = "rgb_encode_fail"
+                self._fail_reasons[reason] = self._fail_reasons.get(reason, 0) + 1
+                continue
+
+            payload = {
+                "object_name": obj_name,
+                "image_width": int(rgb_u8.shape[1]),
+                "image_height": int(rgb_u8.shape[0]),
+                "fx": fx,
+                "fy": fy,
+                "cx": cx,
+                "cy": cy,
+                "depth_scale": 0.001,
+                "rgb_jpeg_b64": base64.b64encode(enc.tobytes()).decode("ascii"),
+                "depth_zlib_b64": base64.b64encode(zlib.compress(depth_u16.tobytes())).decode("ascii"),
+                "T_cam_obj_gt": np.asarray(T_cam_obj_gt, dtype=np.float32).reshape(-1).tolist(),
+                "trans_thresh_m": float(self._trans_thresh_m),
+                "rot_thresh_rad": float(self._rot_thresh_rad),
+            }
+
+            try:
+                out = self._post_eval(payload)
+                self._num_success_http += 1
+                terr = float(out.get("trans_err_m", -1.0))
+                rerr = float(out.get("rot_err_rad", -1.0))
+                if self._use_icp_success:
+                    norm = self.unwrap(target=NormalizeEnv)
+                    cur = norm.normalizer.unnormalize_obs({"partial_cloud": obs["partial_cloud"][env_id:env_id+1]})["partial_cloud"][0]
+                    cur_cloud = np.asarray(dcn(cur), dtype=np.float32)
+                    goal_cloud = self._sample_goal_cloud(obj_name, n_points=int(cur_cloud.shape[0]))
+                    terr, rerr = self._icp_error_to_goal(obj_name, goal_cloud, cur_cloud)
+                correct = bool((terr <= self._trans_thresh_m) and (rerr <= self._rot_thresh_rad))
+                if correct:
+                    self._num_correct += 1
+                obj_stat = self._per_obj.setdefault(
+                    obj_name,
+                    {
+                        "total": 0,
+                        "correct": 0,
+                        "sum_trans_err_m": 0.0,
+                        "sum_rot_err_rad": 0.0,
+                    },
+                )
+                obj_stat["total"] += 1
+                obj_stat["correct"] += int(correct)
+                if terr >= 0.0:
+                    obj_stat["sum_trans_err_m"] += terr
+                if rerr >= 0.0:
+                    obj_stat["sum_rot_err_rad"] += rerr
+                self._records.append({
+                    "object_name": obj_name,
+                    "correct": correct,
+                    "trans_err_m": terr,
+                    "rot_err_rad": rerr,
+                })
+            except Exception as e:
+                reason = f"service_error:{type(e).__name__}"
+                self._fail_reasons[reason] = self._fail_reasons.get(reason, 0) + 1
+                obj_stat = self._per_obj.setdefault(obj_name, {"total": 0, "correct": 0})
+                obj_stat["total"] += 1
+                self._records.append({"object_name": obj_name, "correct": False, "error": str(e)})
+
+        return obs, rew, done, info
+
+    def save(self):
+        overall_acc = (float(self._num_correct) / float(self._num_total)) if self._num_total > 0 else 0.0
+        valid = [r for r in self._records if ("trans_err_m" in r and r["trans_err_m"] >= 0)]
+        mean_trans = float(np.mean([r["trans_err_m"] for r in valid])) if len(valid) > 0 else -1.0
+        mean_rot = float(np.mean([r["rot_err_rad"] for r in valid])) if len(valid) > 0 else -1.0
+        print(
+            f"[FoundationPoseEval] total={self._num_total}, "
+            f"correct={self._num_correct}, acc={overall_acc:.4f}, "
+            f"service_ok={self._num_success_http}"
+        )
+        print(
+            f"[FoundationPoseEval] overall mean_err: "
+            f"trans={mean_trans:.4f}m rot={mean_rot:.4f}rad"
+        )
+        print("[FoundationPoseEval] per-object accuracy:")
+        per_obj_acc = {}
+        for name in sorted(self._per_obj.keys()):
+            t = int(self._per_obj[name]["total"])
+            c = int(self._per_obj[name]["correct"])
+            a = (float(c) / float(t)) if t > 0 else 0.0
+            mean_trans = (float(self._per_obj[name]["sum_trans_err_m"]) / float(t)) if t > 0 else 0.0
+            mean_rot = (float(self._per_obj[name]["sum_rot_err_rad"]) / float(t)) if t > 0 else 0.0
+            per_obj_acc[name] = {
+                "total": t,
+                "correct": c,
+                "accuracy": a,
+                "mean_trans_err_m": mean_trans,
+                "mean_rot_err_rad": mean_rot,
+            }
+            print(
+                f"  - {name}: {c}/{t} = {a:.4f} | "
+                f"mean_trans={mean_trans:.4f}m mean_rot={mean_rot:.4f}rad"
+            )
+
+        if len(self._fail_reasons) > 0:
+            print("[FoundationPoseEval] fail reasons:")
+            for k, v in sorted(self._fail_reasons.items(), key=lambda kv: kv[1], reverse=True):
+                print(f"  - {k}: {v}")
+
+        summary = {
+            "total": int(self._num_total),
+            "correct": int(self._num_correct),
+            "accuracy": overall_acc,
+            "mean_trans_err_m": mean_trans,
+            "mean_rot_err_rad": mean_rot,
+            "per_object": per_obj_acc,
+            "fail_reasons": self._fail_reasons,
+            "trans_thresh_m": float(self._trans_thresh_m),
+            "rot_thresh_rad": float(self._rot_thresh_rad),
+        }
+        with open(str(self._save_dir / 'foundationpose_accuracy_summary.json'), 'w') as f:
+            json.dump(summary, f, indent=2)
+        with open(str(self._save_dir / 'foundationpose_accuracy_records.pkl'), 'wb') as f:
             pickle.dump(self._records, f)
 
 

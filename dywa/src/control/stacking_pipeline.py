@@ -11,15 +11,18 @@ from .dywa_adjust_module import DywaAdjustModuleConfig, DywaPoseAdjustModule
 from .grasp_action_module import GraspExecutionModule
 from .grasp_point_module import GeometricGraspPointModule
 from .gt_task_reader import BlockTarget, GtTaskReader
-from .linemod_opencv import CameraIntrinsics
-from .pose_recognition_module import LinemodPoseRecognitionModule, decode_rgb_depth_payload
+from .pose_recognition_module import (
+    CameraIntrinsics,
+    FoundationPoseInferClient,
+    LocalPointCloudRecognitionModule,
+    decode_rgb_depth_payload,
+)
 from .se3 import SE3, assert_se3
 
 
 @dataclass
 class PipelineConfig:
     scene_root: Path
-    template_db: Path
     block_assets_dir: Path
     dywa_export_dir: Path
     dywa_device: str = "cuda:0"
@@ -45,7 +48,11 @@ class PipelineConfig:
     max_action_step_pos_m: float = 0.03
     max_action_step_rot_rad: float = 0.35
     max_action_step_gripper: float = 0.6
-    linemod_match_threshold: float = 60.0
+    pose_debug: bool = False
+    # 完成门控：icp=与 DyWA 相同局部位姿；foundationpose=ADJUST 阶段用 FP 位姿判 att_ok/工作区
+    completion_method: str = "icp"
+    foundationpose_pose_url: str = "http://127.0.0.1:18080/infer_pose"
+    foundationpose_http_timeout_s: float = 8.0
 
 
 @dataclass
@@ -61,7 +68,7 @@ class BlockStackingPipeline:
     def __init__(self, cfg: PipelineConfig):
         self.cfg = cfg
         self._gt = GtTaskReader(cfg.scene_root)
-        self._pose = LinemodPoseRecognitionModule(cfg.template_db)
+        self._pose = LocalPointCloudRecognitionModule()
         self._adjust = DywaPoseAdjustModule(
             DywaAdjustModuleConfig(
                 export_dir=cfg.dywa_export_dir,
@@ -74,6 +81,13 @@ class BlockStackingPipeline:
         self._grasp_exec = GraspExecutionModule(steps_per_segment=cfg.grasp_steps_per_segment)
         self._scene_states: Dict[int, SceneState] = {}
         self._scene_targets: Dict[int, List[BlockTarget]] = {}
+        cm = str(cfg.completion_method).lower()
+        self._fp_client: FoundationPoseInferClient | None = None
+        if cm in ("foundationpose", "fp"):
+            self._fp_client = FoundationPoseInferClient(
+                service_url=cfg.foundationpose_pose_url,
+                timeout_s=cfg.foundationpose_http_timeout_s,
+            )
 
     def _targets_for_scene(self, scene_id: int) -> List[BlockTarget]:
         if scene_id not in self._scene_targets:
@@ -257,11 +271,43 @@ class BlockStackingPipeline:
             T_world_cam=T_world_cam,
             target_T_world_block=target_T_world_block_dywa,
             n_points=1024,
-            match_threshold=float(self.cfg.linemod_match_threshold),
+            debug=bool(self.cfg.pose_debug),
         )
-        pos_err = self._translation_err(obs.T_world_block, target_T_world_block_dywa)
-        rot_err_deg = self._rotation_err_deg(obs.T_world_block, target_T_world_block_dywa)
-        in_region = self._is_within_adjust_region(obs.T_world_block, target_T_world_block_dywa)
+        if self.cfg.pose_debug and obs.debug is not None:
+            print(
+                "[POSE DEBUG] "
+                f"obj={obs.debug.get('object_name')} "
+                f"score={obs.debug.get('score')} "
+                f"mask_pixels={obs.debug.get('mask_pixels')}"
+            )
+
+        cm = str(self.cfg.completion_method).lower()
+        gate_source = "icp"
+        fp_gate_error: str | None = None
+        T_for_gate = np.asarray(obs.T_world_block, dtype=np.float32)
+        if (
+            cm in ("foundationpose", "fp")
+            and state.phase == "ADJUST"
+            and self._fp_client is not None
+        ):
+            try:
+                T_for_gate = self._fp_client.infer_T_world_block(
+                    object_name=target.object_name,
+                    rgb_bgr=rgb,
+                    depth_u16=np.asarray(depth, dtype=np.uint16),
+                    intrinsics=intr,
+                    depth_scale=float(req["depth_scale"]),
+                    T_world_cam=T_world_cam,
+                )
+                gate_source = "foundationpose"
+            except Exception as e:
+                fp_gate_error = str(e)
+                gate_source = "foundationpose_fallback_icp"
+                T_for_gate = np.asarray(obs.T_world_block, dtype=np.float32)
+
+        pos_err = self._translation_err(T_for_gate, target_T_world_block_dywa)
+        rot_err_deg = self._rotation_err_deg(T_for_gate, target_T_world_block_dywa)
+        in_region = self._is_within_adjust_region(T_for_gate, target_T_world_block_dywa)
 
         # 1) ADJUST 阶段：姿态优先；位置只需进入工作区
         if state.phase == "ADJUST":
@@ -305,6 +351,9 @@ class BlockStackingPipeline:
                 "target_pos_grasp_m": np.asarray(target_T_world_block_grasp[:3, 3], dtype=np.float32).tolist(),
                 "object_name": target.object_name,
                 "safety": safety,
+                "pose_debug": obs.debug if self.cfg.pose_debug else None,
+                "completion_gate_source": gate_source,
+                "completion_gate_fp_error": fp_gate_error,
             }
 
         # 3) GRASPED 阶段：抓取后平移到 GT 目标位置，再切下一块
@@ -340,6 +389,9 @@ class BlockStackingPipeline:
                 "target_pos_grasp_m": np.asarray(target_T_world_block_grasp[:3, 3], dtype=np.float32).tolist(),
                 "object_name": target.object_name,
                 "safety": safety,
+                "pose_debug": obs.debug if self.cfg.pose_debug else None,
+                "completion_gate_source": gate_source,
+                "completion_gate_fp_error": fp_gate_error,
             }
 
         return {"error": f"unknown phase={state.phase}", "actions": [], "scene_done": False}

@@ -23,17 +23,30 @@ GRASP_STEPS_PER_SEGMENT="${GRASP_STEPS_PER_SEGMENT:-6}"
 MAX_ACTION_STEP_POS_M="${MAX_ACTION_STEP_POS_M:-0.03}"
 MAX_ACTION_STEP_ROT_RAD="${MAX_ACTION_STEP_ROT_RAD:-0.35}"
 MAX_ACTION_STEP_GRIPPER="${MAX_ACTION_STEP_GRIPPER:-0.6}"
-LINEMOD_MATCH_THRESHOLD="${LINEMOD_MATCH_THRESHOLD:-60.0}"
+POSE_DEBUG="${POSE_DEBUG:-false}"
+# icp | foundationpose — ADJUST 阶段「可抓取」门控：后者每步调 FP infer（仅门控，DyWA 仍用局部位姿）
+COMPLETION_METHOD="${COMPLETION_METHOD:-icp}"
+FOUNDATIONPOSE_POSE_URL="${FOUNDATIONPOSE_POSE_URL:-http://127.0.0.1:18080/infer_pose}"
+FOUNDATIONPOSE_HTTP_TIMEOUT_S="${FOUNDATIONPOSE_HTTP_TIMEOUT_S:-8.0}"
 SCENE_ROOT="${SCENE_ROOT:-block_data/SCENEs_400_Goal_Jsons}"
-TEMPLATE_DB="${TEMPLATE_DB:-block_data/linemod_templates-real}"
 BLOCK_ASSETS_DIR="${BLOCK_ASSETS_DIR:-block_data/block_assets}"
 DYWA_EXPORT_DIR="${DYWA_EXPORT_DIR:-exported_abs_goal_1view}"
+
+POSE_DEBUG_NORM="$(echo "${POSE_DEBUG}" | tr '[:upper:]' '[:lower:]')"
+POSE_DEBUG_FLAG=()
+if [[ "${POSE_DEBUG_NORM}" == "true" || "${POSE_DEBUG_NORM}" == "1" || "${POSE_DEBUG_NORM}" == "yes" ]]; then
+  POSE_DEBUG_FLAG=(--pose-debug)
+elif [[ "${POSE_DEBUG_NORM}" == "false" || "${POSE_DEBUG_NORM}" == "0" || "${POSE_DEBUG_NORM}" == "no" ]]; then
+  POSE_DEBUG_FLAG=()
+else
+  echo "[start_dywa_policy_server] 无效 POSE_DEBUG=${POSE_DEBUG}（支持 true/false/1/0/yes/no）" >&2
+  exit 2
+fi
 
 python3 -m dywa.src.control.dywa_policy_server \
   --host "${HOST}" \
   --port "${PORT}" \
   --scene-root "${SCENE_ROOT}" \
-  --template-db "${TEMPLATE_DB}" \
   --block-assets-dir "${BLOCK_ASSETS_DIR}" \
   --dywa-export-dir "${DYWA_EXPORT_DIR}" \
   --dywa-device "${DEVICE}" \
@@ -53,4 +66,7 @@ python3 -m dywa.src.control.dywa_policy_server \
   --max-action-step-pos-m "${MAX_ACTION_STEP_POS_M}" \
   --max-action-step-rot-rad "${MAX_ACTION_STEP_ROT_RAD}" \
   --max-action-step-gripper "${MAX_ACTION_STEP_GRIPPER}" \
-  --linemod-match-threshold "${LINEMOD_MATCH_THRESHOLD}"
+  "${POSE_DEBUG_FLAG[@]}" \
+  --completion-method "${COMPLETION_METHOD}" \
+  --foundationpose-pose-url "${FOUNDATIONPOSE_POSE_URL}" \
+  --foundationpose-http-timeout-s "${FOUNDATIONPOSE_HTTP_TIMEOUT_S}"

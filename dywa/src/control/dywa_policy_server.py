@@ -20,7 +20,6 @@ class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 33060
     scene_root: Path = Path("block_data/SCENEs_400_Goal_Jsons")
-    template_db: Path = Path("block_data/linemod_templates")
     block_assets_dir: Path = Path("block_data/block_assets")
     dywa_export_dir: Path = Path("exported_abs_goal_1view")
     dywa_device: str = "cuda:0"
@@ -40,7 +39,10 @@ class ServerConfig:
     max_action_step_pos_m: float = 0.03
     max_action_step_rot_rad: float = 0.35
     max_action_step_gripper: float = 0.6
-    linemod_match_threshold: float = 60.0
+    pose_debug: bool = False
+    completion_method: str = "icp"
+    foundationpose_pose_url: str = "http://127.0.0.1:18080/infer_pose"
+    foundationpose_http_timeout_s: float = 8.0
 
 
 class DywaPolicyServer:
@@ -51,7 +53,6 @@ class DywaPolicyServer:
         self.pipeline = BlockStackingPipeline(
             PipelineConfig(
                 scene_root=cfg.scene_root,
-                template_db=cfg.template_db,
                 block_assets_dir=cfg.block_assets_dir,
                 dywa_export_dir=cfg.dywa_export_dir,
                 dywa_device=cfg.dywa_device,
@@ -71,7 +72,10 @@ class DywaPolicyServer:
                 max_action_step_pos_m=cfg.max_action_step_pos_m,
                 max_action_step_rot_rad=cfg.max_action_step_rot_rad,
                 max_action_step_gripper=cfg.max_action_step_gripper,
-                linemod_match_threshold=cfg.linemod_match_threshold,
+                pose_debug=cfg.pose_debug,
+                completion_method=cfg.completion_method,
+                foundationpose_pose_url=cfg.foundationpose_pose_url,
+                foundationpose_http_timeout_s=cfg.foundationpose_http_timeout_s,
             )
         )
         self._lock = asyncio.Lock()

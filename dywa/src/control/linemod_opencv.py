@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -22,6 +22,42 @@ class CameraIntrinsics:
     fy: float
     cx: float
     cy: float
+
+
+def _match_numeric_attr(match_item: Any, name: str) -> Optional[float]:
+    """安全读取 match 条目的数值字段，兼容属性/可调用属性。"""
+    try:
+        if not hasattr(match_item, name):
+            return None
+        value = getattr(match_item, name)
+        if callable(value):
+            value = value()
+        return float(value)
+    except Exception:
+        return None
+
+
+def _match_similarity_score(match_item: Any) -> Tuple[float, str]:
+    """
+    提取匹配分数并归一化到越大越好、常见 0~100 的范围。
+    兼容不同 OpenCV 绑定字段：
+    - similarity / score: 越大越好
+    - distance: 越小越好（映射为 100-distance）
+    """
+    for key in ("similarity", "score"):
+        val = _match_numeric_attr(match_item, key)
+        if val is None:
+            continue
+        # 某些实现返回 0~1，统一放大到 0~100
+        if 0.0 <= val <= 1.0:
+            val = val * 100.0
+        return float(val), key
+
+    dist = _match_numeric_attr(match_item, "distance")
+    if dist is not None:
+        return float(max(0.0, 100.0 - dist)), "distance"
+
+    return 0.0, "missing"
 
     def K(self) -> np.ndarray:
         return np.array(
@@ -203,7 +239,8 @@ class OpenCvLinemodDetector:
         )
         if out is None:
             raise RuntimeError(f"detect_and_mask 失败: {object_id}")
-        return out
+        T_cam_obj, mask, pc_cam, _ = out
+        return T_cam_obj, mask, pc_cam
 
     def _fallback_depth(self, depth_m: np.ndarray, u: int, v: int) -> float:
         h, w = depth_m.shape[:2]
@@ -246,11 +283,13 @@ class OpenCvLinemodDetector:
             # OpenCV Python 的 match item 通常含：class_id, template_id, similarity, x, y
             if hasattr(m, "class_id") and str(m.class_id) != want_id:
                 continue
-            if best is None or float(m.similarity) > float(best.similarity):
+            m_score, _ = _match_similarity_score(m)
+            b_score, _ = _match_similarity_score(best) if best is not None else (float("-inf"), "none")
+            if best is None or m_score > b_score:
                 best = m
 
         if best is None:
-            best = max(matches, key=lambda mm: float(mm.similarity))
+            best = max(matches, key=lambda mm: _match_similarity_score(mm)[0])
         return float(best.x), float(best.y)
 
 
@@ -351,12 +390,13 @@ def detect_object_pose(
         cid = getattr(m, "class_id", None)
         if cid is not None and str(cid) != want_id:
             continue
-        sim = float(getattr(m, "similarity", 0))
-        if best is None or sim > float(getattr(best, "similarity", 0)):
+        sim, _ = _match_similarity_score(m)
+        best_sim, _ = _match_similarity_score(best) if best is not None else (float("-inf"), "none")
+        if best is None or sim > best_sim:
             best = m
     if best is None:
-        best = max(matches, key=lambda mm: float(getattr(mm, "similarity", 0)))
-    similarity = float(getattr(best, "similarity", 0))
+        best = max(matches, key=lambda mm: _match_similarity_score(mm)[0])
+    similarity, _ = _match_similarity_score(best)
     if similarity < match_threshold:
         return None
 
@@ -429,13 +469,15 @@ def detect_object_mask_pointcloud(
     n_points: int = 1024,
     roi_radius_px: int = 80,
     depth_band_m: float = 0.03,
-) -> Optional[Tuple[SE3, np.ndarray, np.ndarray]]:
+    debug: bool = False,
+) -> Optional[Tuple[SE3, np.ndarray, np.ndarray, Optional[Dict[str, Any]]]]:
     """检测位姿并输出 mask 与目标点云（v1：ROI+深度阈值近似）.
 
     输出：
       - `T_cam_obj`: (4,4) SE3（OpenCV 相机系：X右Y下Z前，平移单位米）
       - `mask`: (H,W) uint8，目标为 255，背景 0
       - `pc_cam`: (n_points,3) float32，相机系点云，单位米
+      - `debug_info`: 调试信息（可选）
     """
     T_cam_obj = detect_object_pose(
         rgb=rgb,
@@ -497,17 +539,20 @@ def detect_object_mask_pointcloud(
         cid = getattr(m, "class_id", None)
         if cid is not None and str(cid) != object_name:
             continue
-        sim = float(getattr(m, "similarity", 0))
-        if best is None or sim > float(getattr(best, "similarity", 0)):
+        sim, _ = _match_similarity_score(m)
+        best_sim, _ = _match_similarity_score(best) if best is not None else (float("-inf"), "none")
+        if best is None or sim > best_sim:
             best = m
     if best is None:
-        best = max(matches, key=lambda mm: float(getattr(mm, "similarity", 0)))
+        best = max(matches, key=lambda mm: _match_similarity_score(mm)[0])
 
     h, w = depth_m.shape[:2]
     u = int(round(float(getattr(best, "x", w * 0.5))))
     v = int(round(float(getattr(best, "y", h * 0.5))))
     u = int(np.clip(u, 0, w - 1))
     v = int(np.clip(v, 0, h - 1))
+    similarity, similarity_key = _match_similarity_score(best)
+    template_id = int(getattr(best, "template_id", -1))
 
     # ROI + 深度带宽：近似 mask
     r = int(max(1, roi_radius_px))
@@ -547,7 +592,134 @@ def detect_object_mask_pointcloud(
     pts = pts[idx].astype(np.float32, copy=False)
 
     assert_se3(T_cam_obj)
-    return T_cam_obj, mask, pts
+    debug_info: Optional[Dict[str, Any]] = None
+    if debug:
+        import base64
+
+        overlay = np.ascontiguousarray(rgb.copy())
+        try:
+            cv2.rectangle(overlay, (u0, v0), (u1 - 1, v1 - 1), (0, 255, 0), 2)
+            cv2.circle(overlay, (u, v), 3, (0, 0, 255), -1)
+            cv2.putText(
+                overlay,
+                f"{object_name} sim={similarity:.1f}",
+                (max(0, u0), max(16, v0 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+            ok_dbg, enc_dbg = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            overlay_b64 = base64.b64encode(enc_dbg.tobytes()).decode("ascii") if ok_dbg else None
+        except Exception:
+            overlay_b64 = None
+
+        debug_info = {
+            "object_name": str(object_name),
+            "similarity": similarity,
+            "similarity_key": similarity_key,
+            "template_id": template_id,
+            "bbox_xyxy": [int(u0), int(v0), int(u1 - 1), int(v1 - 1)],
+            "center_xy": [int(u), int(v)],
+            "overlay_jpeg_b64": overlay_b64,
+        }
+
+    return T_cam_obj, mask, pts, debug_info
+
+
+def diagnose_linemod_failure(
+    *,
+    rgb: np.ndarray,
+    depth: np.ndarray,
+    object_name: str,
+    template_db: Optional[Path] = None,
+    depth_scale: float = 0.001,
+    match_threshold: float = 80.0,
+) -> Dict[str, Any]:
+    """诊断 LINEMOD 失败原因，返回结构化调试信息。"""
+    info: Dict[str, Any] = {
+        "object_name": str(object_name),
+        "match_threshold": float(match_threshold),
+        "reason": "unknown",
+    }
+
+    depth_arr = np.asarray(depth)
+    finite = np.isfinite(depth_arr) if depth_arr.size > 0 else np.zeros((0,), dtype=bool)
+    positive = (depth_arr > 0) if depth_arr.size > 0 else np.zeros((0,), dtype=bool)
+    valid = finite & positive if depth_arr.size > 0 else np.zeros((0,), dtype=bool)
+    info["depth_dtype"] = str(depth_arr.dtype)
+    info["depth_shape"] = list(depth_arr.shape) if depth_arr.ndim >= 2 else []
+    info["depth_valid_ratio"] = float(valid.mean()) if valid.size > 0 else 0.0
+
+    if template_db is None:
+        template_db = _default_template_dir()
+    template_db = Path(template_db)
+    yml_path = template_db / f"{object_name}.yml"
+    info["template_path"] = str(yml_path)
+    info["template_exists"] = bool(yml_path.exists())
+    if not yml_path.exists():
+        info["reason"] = "template_yml_missing"
+        return info
+
+    try:
+        detector = _get_linemod_detector()
+    except Exception as e:
+        info["reason"] = "linemod_detector_unavailable"
+        info["detector_error"] = str(e)
+        return info
+
+    loaded = False
+    try:
+        loaded = bool(_read_detector_from_file(detector, class_id=object_name, path=yml_path))
+    except Exception as e:
+        info["reason"] = "template_read_exception"
+        info["template_read_error"] = str(e)
+        return info
+    info["template_loaded"] = loaded
+    if not loaded:
+        info["reason"] = "template_read_failed"
+        return info
+
+    depth_u16 = _to_linemod_depth_uint16(depth, float(depth_scale))
+    info["depth_u16_nonzero_ratio"] = float((depth_u16 > 0).mean()) if depth_u16.size > 0 else 0.0
+
+    def _run_match(sources: list[np.ndarray], name: str) -> Tuple[int, float, str]:
+        try:
+            ms = detector.match(sources, float(match_threshold))  # type: ignore[union-attr]
+        except Exception as e:
+            info[f"{name}_error"] = str(e)
+            return 0, 0.0, "missing"
+        if ms is None:
+            return 0, 0.0, "missing"
+        best_sim = 0.0
+        best_key = "missing"
+        count = 0
+        for m in ms:
+            cid = getattr(m, "class_id", None)
+            if cid is not None and str(cid) != object_name:
+                continue
+            count += 1
+            sim, key = _match_similarity_score(m)
+            if sim >= best_sim:
+                best_sim = sim
+                best_key = key
+        return count, best_sim, best_key
+
+    rgbd_count, rgbd_best, rgbd_key = _run_match([rgb, depth_u16], "rgbd_match")
+    rgb_count, rgb_best, rgb_key = _run_match([rgb], "rgb_match")
+    info["rgbd_match_count"] = int(rgbd_count)
+    info["rgb_match_count"] = int(rgb_count)
+    info["best_similarity"] = float(max(rgbd_best, rgb_best))
+    info["similarity_key"] = rgbd_key if rgbd_best >= rgb_best else rgb_key
+
+    if rgbd_count == 0 and rgb_count == 0:
+        info["reason"] = "no_matches"
+    elif float(info["best_similarity"]) < float(match_threshold):
+        info["reason"] = "similarity_below_threshold"
+    else:
+        info["reason"] = "pose_or_mask_stage_failed"
+    return info
 
 
 def _get_linemod_detector():

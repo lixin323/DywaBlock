@@ -246,8 +246,14 @@ class StudentAgentRMA(nn.Module):
         ## encoder
         embed_tokens = self.encoder(self.vision_tokens)
 
-        ## pose prediction
-        self.pose_losses['vision'], pose_pred = self.vision_pose_predictor(self.vision_tokens, obs)
+        ## pose prediction (训练需 rel_goal_gt 监督；纯推理且不把 pose 拼进 decoder 时可跳过)
+        if self.training or self.cfg.merge_pose_pred:
+            self.pose_losses['vision'], pose_pred = self.vision_pose_predictor(
+                self.vision_tokens, obs
+            )
+        else:
+            self.pose_losses['vision'] = 0
+            pose_pred = None
         if self.cfg.merge_pose_pred:
             pose_pred_tokens = self.tokenizer['pose_pred'](pose_pred)[:, None]
             embed_tokens = th.cat([pose_pred_tokens, embed_tokens], dim=-2)
